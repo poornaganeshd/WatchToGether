@@ -231,7 +231,7 @@ export function useWebRTC(roomId: string) {
       return false;
     };
 
-    socket.on("user_joined", async ({ socketId }) => {
+    const handleUserJoined = async ({ socketId }: { socketId: string }) => {
       if (!isMounted) return;
       const ready = await waitForMedia();
       if (!isMounted || !ready) return;
@@ -254,19 +254,22 @@ export function useWebRTC(roomId: string) {
       if (screenStreamRef.current) {
         socket.emit("screen_share_start", { roomId, streamId: screenStreamRef.current.id });
       }
-    });
+    };
+    socket.on("user_joined", handleUserJoined);
 
-    socket.on("participant_status", ({ socketId, cam, mic }) => {
+    const handleParticipantStatus = ({ socketId, cam, mic }: { socketId: string; cam: boolean; mic: boolean }) => {
       if (!isMounted) return;
       setPeerStatuses((prev) => ({ ...prev, [socketId]: { cam, mic } }));
-    });
+    };
+    socket.on("participant_status", handleParticipantStatus);
 
-    socket.on("room_participant_statuses", (statuses: Record<string, { cam: boolean; mic: boolean }>) => {
+    const handleRoomParticipantStatuses = (statuses: Record<string, { cam: boolean; mic: boolean }>) => {
       if (!isMounted) return;
       setPeerStatuses((prev) => ({ ...prev, ...statuses }));
-    });
+    };
+    socket.on("room_participant_statuses", handleRoomParticipantStatuses);
 
-    socket.on("webrtc_offer", async ({ offer, from }) => {
+    const handleOffer = async ({ offer, from }: { offer: RTCSessionDescriptionInit; from: string }) => {
       if (!isMounted) return;
       const currentSession = useSocketStore.getState().currentRoomSession;
       if (!currentSession || currentSession.roomId !== roomId) return;
@@ -300,9 +303,10 @@ export function useWebRTC(roomId: string) {
       } catch (err) {
         console.error("Failed to handle offer", err);
       }
-    });
+    };
+    socket.on("webrtc_offer", handleOffer);
 
-    socket.on("webrtc_answer", async ({ answer, from }) => {
+    const handleAnswer = async ({ answer, from }: { answer: RTCSessionDescriptionInit; from: string }) => {
       if (!isMounted) return;
       const currentSession = useSocketStore.getState().currentRoomSession;
       if (!currentSession || currentSession.roomId !== roomId) return;
@@ -317,9 +321,10 @@ export function useWebRTC(roomId: string) {
           console.error("Failed to set answer", err);
         }
       }
-    });
+    };
+    socket.on("webrtc_answer", handleAnswer);
 
-    socket.on("webrtc_ice_candidate", async ({ candidate, from }) => {
+    const handleIceCandidate = async ({ candidate, from }: { candidate: RTCIceCandidateInit; from: string }) => {
       if (!isMounted) return;
       const currentSession = useSocketStore.getState().currentRoomSession;
       if (!currentSession || currentSession.roomId !== roomId) return;
@@ -338,9 +343,10 @@ export function useWebRTC(roomId: string) {
         if (!pendingCandidates.current[from]) pendingCandidates.current[from] = [];
         pendingCandidates.current[from].push(candidate);
       }
-    });
+    };
+    socket.on("webrtc_ice_candidate", handleIceCandidate);
 
-    socket.on("user_left", ({ socketId }) => {
+    const handleUserLeft = ({ socketId }: { socketId: string }) => {
       if (!isMounted) return;
       if (peerConnections.current[socketId]) {
         const pc = peerConnections.current[socketId];
@@ -364,9 +370,10 @@ export function useWebRTC(roomId: string) {
         delete next[socketId];
         return next;
       });
-    });
+    };
+    socket.on("user_left", handleUserLeft);
 
-    socket.on("screen_share_start", ({ socketId, streamId }) => {
+    const handleScreenShareStart = ({ socketId, streamId }: { socketId: string; streamId: string }) => {
       if (!isMounted) return;
       streamStateContext.current.screenShareStreamIds[socketId] = streamId;
 
@@ -385,9 +392,10 @@ export function useWebRTC(roomId: string) {
         ...prev,
         [socketId]: streamToPromote || prev[socketId] || streamId,
       }));
-    });
+    };
+    socket.on("screen_share_start", handleScreenShareStart);
 
-    socket.on("screen_share_stop", ({ socketId }) => {
+    const handleScreenShareStop = ({ socketId }: { socketId: string }) => {
       if (!isMounted) return;
       delete streamStateContext.current.screenShareStreamIds[socketId];
       setScreenShares((prev) => {
@@ -395,7 +403,8 @@ export function useWebRTC(roomId: string) {
         delete next[socketId];
         return next;
       });
-    });
+    };
+    socket.on("screen_share_stop", handleScreenShareStop);
 
     const handleSocketDisconnect = () => {
       if (!isMounted) return;
@@ -458,15 +467,15 @@ export function useWebRTC(roomId: string) {
       isMounted = false;
       
       // 1. Remove socket listeners
-      socket.off("user_joined");
-      socket.off("webrtc_offer");
-      socket.off("webrtc_answer");
-      socket.off("webrtc_ice_candidate");
-      socket.off("user_left");
-      socket.off("participant_status");
-      socket.off("room_participant_statuses");
-      socket.off("screen_share_start");
-      socket.off("screen_share_stop");
+      socket.off("user_joined", handleUserJoined);
+      socket.off("webrtc_offer", handleOffer);
+      socket.off("webrtc_answer", handleAnswer);
+      socket.off("webrtc_ice_candidate", handleIceCandidate);
+      socket.off("user_left", handleUserLeft);
+      socket.off("participant_status", handleParticipantStatus);
+      socket.off("room_participant_statuses", handleRoomParticipantStatuses);
+      socket.off("screen_share_start", handleScreenShareStart);
+      socket.off("screen_share_stop", handleScreenShareStop);
       socket.off("disconnect", handleSocketDisconnect);
       socket.off("connect", handleSocketConnect);
 

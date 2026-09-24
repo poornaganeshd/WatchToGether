@@ -3,8 +3,39 @@
 @tailwind utilities;
 
 @layer base {
+  html {
+    color-scheme: dark;
+  }
+
   body {
-    @apply bg-slate-900 text-slate-100 antialiased;
+    @apply bg-ink-950 text-slate-100 antialiased;
+  }
+
+  ::selection {
+    @apply bg-indigo-500/30;
+  }
+
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: rgba(148, 163, 184, 0.25) transparent;
+  }
+
+  *::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+
+  *::-webkit-scrollbar-thumb {
+    background: rgba(148, 163, 184, 0.2);
+    border-radius: 9999px;
+  }
+
+  *::-webkit-scrollbar-thumb:hover {
+    background: rgba(148, 163, 184, 0.35);
+  }
+
+  :focus-visible {
+    @apply outline-none ring-2 ring-indigo-400/70 ring-offset-0;
   }
 
   :fullscreen,
@@ -18,5 +49,51 @@
     margin: 0 !important;
     padding: 0 !important;
     box-sizing: border-box !important;
+  }
+}
+
+@layer components {
+  .glass {
+    @apply bg-white/[0.03] border border-white/[0.08] backdrop-blur-xl;
+  }
+
+  .card {
+    @apply glass rounded-2xl shadow-card;
+  }
+
+  .input {
+    @apply w-full rounded-xl border border-white/10 bg-ink-900/80 px-4 py-2.5 text-sm text-slate-100 placeholder:text-slate-500 transition-colors focus:border-indigo-400/60 focus:outline-none focus:ring-2 focus:ring-indigo-500/30;
+  }
+
+  .label {
+    @apply mb-1.5 block text-xs font-medium uppercase tracking-wide text-slate-400;
+  }
+
+  .btn {
+    @apply inline-flex items-center justify-center gap-2 rounded-xl px-4 py-2.5 text-sm font-semibold transition-all duration-150 disabled:cursor-not-allowed disabled:opacity-50 active:scale-[0.98];
+  }
+
+  .btn-primary {
+    @apply btn bg-gradient-to-r from-indigo-500 to-violet-500 text-white shadow-glow hover:from-indigo-400 hover:to-violet-400;
+  }
+
+  .btn-secondary {
+    @apply btn border border-white/10 bg-white/5 text-slate-200 hover:bg-white/10 hover:text-white;
+  }
+
+  .btn-ghost {
+    @apply btn text-slate-400 hover:bg-white/5 hover:text-white;
+  }
+
+  .btn-danger {
+    @apply btn border border-red-500/30 bg-red-500/10 text-red-300 hover:bg-red-500/20 hover:text-red-200;
+  }
+
+  .chip {
+    @apply inline-flex items-center gap-1 rounded-full border px-2.5 py-0.5 text-[11px] font-medium;
+  }
+
+  .text-gradient {
+    @apply bg-gradient-to-r from-indigo-300 via-violet-300 to-cyan-300 bg-clip-text text-transparent;
   }
 }

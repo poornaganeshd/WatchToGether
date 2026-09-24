@@ -1,139 +1,267 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import api from "../lib/api";
+import {
+  Check, Copy, Crown, Globe2, History, KeyRound, Lock, LogIn, LogOut, MonitorPlay, Plus, RefreshCw, Search,
+  Trash2, UserMinus, UserPlus, Users, X,
+} from "lucide-react";
+import api, { getErrorMessage } from "../lib/api";
 import { useAuthStore } from "../store/useAuthStore";
 import { useSocketStore } from "../store/useSocketStore";
-import { LogOut, Users, MonitorPlay, UserPlus, Check, History } from "lucide-react";
+import { toast } from "../store/useToastStore";
+import { copyToClipboard, greeting, timeAgo } from "../lib/format";
+import Logo from "../components/ui/Logo";
+import Avatar from "../components/ui/Avatar";
+import Spinner from "../components/ui/Spinner";
+import PasswordInput from "../components/PasswordInput";
+
 interface Friend {
   id: string;
-  status: 'PENDING' | 'ACCEPTED';
+  status: "PENDING" | "ACCEPTED";
   isSender: boolean;
-  user: {
-    id: string;
-    name: string;
-    email: string;
-  };
+  user: { id: string; name: string; email: string };
 }
 
+interface RoomSummary {
+  id: string;
+  displayId: string | null;
+  name: string;
+  description?: string | null;
+  isActive: boolean;
+  isPrivate: boolean;
+  hostId: string;
+  host: { name: string };
+  createdAt: string;
+  visitedAt?: string;
+  _count?: { participants: number };
+}
+
+type Tab = "live" | "friends" | "history";
+
 export default function Dashboard() {
-  const [friends, setFriends] = useState<Friend[]>([]);
-  const [roomName, setRoomName] = useState("");
-  const [createPassword, setCreatePassword] = useState("");
-  const [joinRoomId, setJoinRoomId] = useState("");
-  const [joinPassword, setJoinPassword] = useState("");
-  const [friendEmail, setFriendEmail] = useState("");
-  const [activeTab, setActiveTab] = useState<'rooms' | 'friends' | 'history'>('rooms');
-  const [roomHistory, setRoomHistory] = useState<{id: string, displayId: string, name: string, isActive: boolean, hostId: string, host: {name: string}, createdAt: string}[]>([]);
   const { user, logout } = useAuthStore();
   const { socket, connect } = useSocketStore();
   const navigate = useNavigate();
 
-  useEffect(() => {
-    if ("Notification" in window && Notification.permission === "default") {
-      Notification.requestPermission();
-    }
-  }, []);
+  const [activeTab, setActiveTab] = useState<Tab>("live");
+  const [friends, setFriends] = useState<Friend[]>([]);
+  const [publicRooms, setPublicRooms] = useState<RoomSummary[]>([]);
+  const [roomHistory, setRoomHistory] = useState<RoomSummary[]>([]);
+  const [loading, setLoading] = useState({ live: true, friends: true, history: true });
 
-  const fetchFriends = async () => {
+  const [roomName, setRoomName] = useState("");
+  const [isPrivate, setIsPrivate] = useState(true);
+  const [createPassword, setCreatePassword] = useState("");
+  const [isCreating, setIsCreating] = useState(false);
+
+  const [joinCode, setJoinCode] = useState("");
+  const [joinPassword, setJoinPassword] = useState("");
+  const [needsJoinPassword, setNeedsJoinPassword] = useState(false);
+  const [isJoining, setIsJoining] = useState(false);
+
+  const [friendEmail, setFriendEmail] = useState("");
+  const [isSendingRequest, setIsSendingRequest] = useState(false);
+  const [historyFilter, setHistoryFilter] = useState("");
+  const [copiedId, setCopiedId] = useState<string | null>(null);
+
+  const fetchFriends = useCallback(async () => {
     try {
       const res = await api.get("/friends");
       setFriends(res.data.friends);
     } catch (error) {
       console.error("Failed to fetch friends:", error);
+    } finally {
+      setLoading((l) => ({ ...l, friends: false }));
     }
-  };
+  }, []);
 
-  const fetchHistory = async () => {
+  const fetchHistory = useCallback(async () => {
     try {
       const res = await api.get("/rooms/history");
       setRoomHistory(res.data.rooms);
     } catch (error) {
       console.error("Failed to fetch history:", error);
+    } finally {
+      setLoading((l) => ({ ...l, history: false }));
     }
-  };
+  }, []);
+
+  const fetchPublicRooms = useCallback(async () => {
+    try {
+      const res = await api.get("/rooms");
+      setPublicRooms(res.data.rooms);
+    } catch (error) {
+      console.error("Failed to fetch rooms:", error);
+    } finally {
+      setLoading((l) => ({ ...l, live: false }));
+    }
+  }, []);
 
   useEffect(() => {
-    if (!user) {
-      navigate("/login");
-      return;
+    if ("Notification" in window && Notification.permission === "default") {
+      Notification.requestPermission().catch(() => undefined);
     }
+  }, []);
+
+  useEffect(() => {
+    if (!user) return;
     // eslint-disable-next-line react-hooks/set-state-in-effect
     fetchFriends();
     fetchHistory();
+    fetchPublicRooms();
     connect();
-  }, [user, navigate, connect]);
+  }, [user, connect, fetchFriends, fetchHistory, fetchPublicRooms]);
+
+  // Keep the live room list fresh while the dashboard is open.
+  useEffect(() => {
+    if (activeTab !== "live") return;
+    const interval = setInterval(fetchPublicRooms, 15000);
+    return () => clearInterval(interval);
+  }, [activeTab, fetchPublicRooms]);
 
   useEffect(() => {
     if (!socket || !user) return;
 
-    // Join a global room for personal notifications
-    socket.emit("join_global_room", { userId: user.id });
+    const joinGlobal = () => socket.emit("join_global_room", { userId: user.id });
+    joinGlobal();
+    socket.on("connect", joinGlobal);
 
-    const handleNotification = (data: { title: string, body: string }) => {
-      if ("Notification" in window && Notification.permission === "granted") {
-        new Notification(data.title, { body: data.body, icon: "/vite.svg" });
+    const handleNotification = (data: { title: string; body: string; roomId?: string }) => {
+      if (data.title.toLowerCase().includes("friend")) {
+        fetchFriends();
+      }
+      toast.info(
+        data.body,
+        data.roomId ? { label: "Join room", onClick: () => navigate(`/room/${data.roomId}`) } : undefined
+      );
+      if ("Notification" in window && Notification.permission === "granted" && document.hidden) {
+        const n = new Notification(data.title, { body: data.body, icon: "/favicon.svg" });
+        if (data.roomId) {
+          n.onclick = () => {
+            window.focus();
+            navigate(`/room/${data.roomId}`);
+          };
+        }
       }
     };
 
     socket.on("notification", handleNotification);
     return () => {
+      socket.off("connect", joinGlobal);
       socket.off("notification", handleNotification);
     };
-  }, [socket, user]);
+  }, [socket, user, navigate, fetchFriends]);
 
+  if (!user) return null;
 
+  const incomingRequests = friends.filter((f) => f.status === "PENDING" && !f.isSender);
+  const outgoingRequests = friends.filter((f) => f.status === "PENDING" && f.isSender);
+  const acceptedFriends = friends.filter((f) => f.status === "ACCEPTED");
+  const filteredHistory = roomHistory.filter((r) => {
+    const q = historyFilter.trim().toLowerCase();
+    return !q || r.name.toLowerCase().includes(q) || (r.displayId ?? "").toLowerCase().includes(q) || r.host.name.toLowerCase().includes(q);
+  });
 
-  const handleEndRoom = async (roomId: string) => {
-    if (!confirm("Are you sure you want to end this room? It will become inactive for all participants.")) return;
-    try {
-      await api.post(`/rooms/${roomId}/end`);
-      fetchHistory(); // Refresh
-    } catch (error) {
-      console.error("Failed to end room:", error);
+  const handleCopy = async (key: string, text: string) => {
+    if (await copyToClipboard(text)) {
+      setCopiedId(key);
+      setTimeout(() => setCopiedId((c) => (c === key ? null : c)), 1500);
+    } else {
+      toast.error("Couldn't access the clipboard");
     }
   };
 
   const handleCreateRoom = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!roomName.trim() || !createPassword.trim()) return;
+    if (!roomName.trim()) return;
+    if (isPrivate && !createPassword.trim()) {
+      toast.error("Private rooms need a password");
+      return;
+    }
+    setIsCreating(true);
     try {
-      const res = await api.post("/rooms", { name: roomName, password: createPassword, isPrivate: true });
+      const res = await api.post("/rooms", {
+        name: roomName.trim(),
+        isPrivate,
+        password: isPrivate ? createPassword : undefined,
+      });
       navigate(`/room/${res.data.room.id}`);
     } catch (error) {
-      console.error("Failed to create room:", error);
-      alert("Failed to create room.");
+      toast.error(getErrorMessage(error, "Failed to create room"));
+      setIsCreating(false);
     }
   };
 
   const handleJoinRoom = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!joinRoomId.trim() || !joinPassword.trim()) return;
+    let code = joinCode.trim();
+    if (!code) return;
+    // Accept a pasted invite link as well as a code.
+    const linkMatch = code.match(/\/room\/([0-9a-f-]{36})/i);
+    if (linkMatch) code = linkMatch[1];
+
+    setIsJoining(true);
     try {
-      const res = await api.post("/rooms/join", { roomId: joinRoomId, password: joinPassword });
-      navigate(`/room/${res.data.room.id}`);
+      const res = await api.post("/rooms/join", { roomId: code, password: joinPassword || undefined });
+      navigate(`/room/${res.data.room.id}`, { state: { password: joinPassword || undefined } });
     } catch (error: unknown) {
-      console.error("Failed to join room:", error);
-      const err = error as { response?: { data?: { error?: string } } };
-      alert(err.response?.data?.error || "Failed to join room. Check ID and password.");
+      const message = getErrorMessage(error, "Failed to join room");
+      if (message === "Password required") {
+        setNeedsJoinPassword(true);
+        toast.info("This room is private. Enter its password to join.");
+      } else {
+        if (message === "Incorrect password") setNeedsJoinPassword(true);
+        toast.error(message);
+      }
+      setIsJoining(false);
     }
   };
 
-  const handleLogout = () => {
-    logout();
-    navigate("/login");
+  const handleEndRoom = async (roomId: string) => {
+    if (!confirm("End this room for everyone? Participants will be sent back to their dashboards.")) return;
+    try {
+      await api.post(`/rooms/${roomId}/end`);
+      toast.success("Room ended");
+      fetchHistory();
+      fetchPublicRooms();
+    } catch (error) {
+      toast.error(getErrorMessage(error, "Failed to end room"));
+    }
+  };
+
+  const handleDeleteRoom = async (roomId: string) => {
+    if (!confirm("Delete this room permanently? Its chat history will be lost.")) return;
+    try {
+      await api.delete(`/rooms/${roomId}`);
+      toast.success("Room deleted");
+      setRoomHistory((rooms) => rooms.filter((r) => r.id !== roomId));
+      fetchPublicRooms();
+    } catch (error) {
+      toast.error(getErrorMessage(error, "Failed to delete room"));
+    }
+  };
+
+  const handleForgetRoom = async (roomId: string) => {
+    try {
+      await api.delete(`/rooms/history/${roomId}`);
+      setRoomHistory((rooms) => rooms.filter((r) => r.id !== roomId));
+    } catch (error) {
+      toast.error(getErrorMessage(error, "Failed to update history"));
+    }
   };
 
   const handleSendFriendRequest = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!friendEmail.trim()) return;
+    setIsSendingRequest(true);
     try {
-      await api.post("/friends/request", { email: friendEmail });
+      const res = await api.post("/friends/request", { email: friendEmail.trim() });
       setFriendEmail("");
+      toast.success(res.data.message === "Friend request accepted" ? "You're now friends!" : "Friend request sent");
       fetchFriends();
-      alert("Friend request sent!");
-    } catch (error: unknown) {
-      const err = error as { response?: { data?: { error?: string } } };
-      alert(err.response?.data?.error || "Failed to send request");
+    } catch (error) {
+      toast.error(getErrorMessage(error, "Failed to send request"));
+    } finally {
+      setIsSendingRequest(false);
     }
   };
 
@@ -142,221 +270,405 @@ export default function Dashboard() {
       await api.post(`/friends/accept/${friendId}`);
       fetchFriends();
     } catch (error) {
-      console.error("Failed to accept friend request:", error);
+      toast.error(getErrorMessage(error, "Failed to accept request"));
     }
   };
 
-  if (!user) return null;
+  const handleRemoveFriend = async (friend: Friend, verb: string) => {
+    if (friend.status === "ACCEPTED" && !confirm(`Remove ${friend.user.name} from your friends?`)) return;
+    try {
+      await api.delete(`/friends/${friend.id}`);
+      setFriends((list) => list.filter((f) => f.id !== friend.id));
+      toast.success(verb);
+    } catch (error) {
+      toast.error(getErrorMessage(error, "Something went wrong"));
+    }
+  };
+
+  const tabs: { id: Tab; label: string; icon: typeof Globe2; badge?: number }[] = [
+    { id: "live", label: "Live now", icon: Globe2, badge: publicRooms.length || undefined },
+    { id: "friends", label: "Friends", icon: Users, badge: incomingRequests.length || undefined },
+    { id: "history", label: "History", icon: History },
+  ];
 
   return (
-    <div className="min-h-screen p-4 md:p-8 max-w-6xl mx-auto">
-      <div className="flex flex-col md:flex-row justify-between items-start md:items-center mb-8 gap-4">
-        <div>
-          <h1 className="text-3xl font-bold">Dashboard</h1>
-          <p className="text-slate-400">Welcome back, {user.name}</p>
+    <div className="min-h-screen">
+      <div className="pointer-events-none fixed inset-0 -z-10">
+        <div className="absolute -top-40 left-1/3 h-[420px] w-[720px] rounded-full bg-indigo-600/15 blur-[120px]" />
+      </div>
+
+      <header className="sticky top-0 z-40 border-b border-white/5 bg-ink-950/70 backdrop-blur-xl">
+        <div className="mx-auto flex max-w-6xl items-center justify-between px-4 py-3 sm:px-6">
+          <Logo to="/dashboard" size="sm" />
+          <div className="flex items-center gap-3">
+            <div className="hidden text-right sm:block">
+              <p className="text-sm font-medium text-white">{user.name}</p>
+              <p className="text-xs text-slate-500">{user.email}</p>
+            </div>
+            <Avatar name={user.name} seed={user.id} size={36} />
+            <button onClick={logout} className="btn-ghost px-2.5" title="Sign out" aria-label="Sign out">
+              <LogOut size={18} />
+            </button>
+          </div>
         </div>
-        <button onClick={handleLogout} className="flex items-center gap-2 text-slate-400 hover:text-white transition-colors">
-          <LogOut size={18} /> Logout
-        </button>
-      </div>
+      </header>
 
-      <div className="flex gap-4 mb-6 border-b border-slate-800">
-        <button 
-          onClick={() => setActiveTab('rooms')}
-          className={`flex items-center gap-2 px-4 py-3 font-medium transition-all ${activeTab === 'rooms' ? 'text-indigo-400 border-b-2 border-indigo-400' : 'text-slate-400 hover:text-slate-200'}`}
-        >
-          <MonitorPlay size={18} /> Rooms
-        </button>
-        <button 
-          onClick={() => setActiveTab('friends')}
-          className={`flex items-center gap-2 px-4 py-3 font-medium transition-all ${activeTab === 'friends' ? 'text-indigo-400 border-b-2 border-indigo-400' : 'text-slate-400 hover:text-slate-200'}`}
-        >
-          <Users size={18} /> Friends
-        </button>
-        <button 
-          onClick={() => { setActiveTab('history'); fetchHistory(); }}
-          className={`flex items-center gap-2 px-4 py-3 font-medium transition-all ${activeTab === 'history' ? 'text-indigo-400 border-b-2 border-indigo-400' : 'text-slate-400 hover:text-slate-200'}`}
-        >
-          <History size={18} /> History
-        </button>
-      </div>
+      <main className="mx-auto max-w-6xl px-4 py-8 sm:px-6">
+        <section className="mb-8 animate-fade-up">
+          <p className="text-sm text-slate-400">{greeting()},</p>
+          <h1 className="font-display text-3xl font-bold tracking-tight sm:text-4xl">{user.name.split(" ")[0]} 👋</h1>
+        </section>
 
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-        {/* Sidebar Creation Panel */}
-        <div className="bg-slate-900 border border-slate-800 p-6 rounded-2xl h-fit">
-          {activeTab === 'rooms' ? (
-            <>
-              <h2 className="text-xl font-semibold mb-2">Create Room</h2>
-              <p className="text-slate-400 mb-4 text-sm">Start a new watch party and invite friends.</p>
-              <form onSubmit={handleCreateRoom}>
-                <input 
-                  type="text" 
-                  value={roomName}
-                  onChange={(e) => setRoomName(e.target.value)}
-                  placeholder="Room Name" 
-                  className="w-full bg-slate-950 border border-slate-800 rounded-lg px-4 py-2 text-slate-200 focus:outline-none focus:ring-2 focus:ring-indigo-500 mb-3" 
-                  required
-                />
-                <input 
-                  type="password" 
+        <section className="mb-10 grid gap-4 md:grid-cols-2">
+          {/* Create */}
+          <form onSubmit={handleCreateRoom} className="card relative overflow-hidden p-6 animate-fade-up">
+            <div className="pointer-events-none absolute -right-16 -top-16 h-48 w-48 rounded-full bg-indigo-500/20 blur-3xl" />
+            <div className="mb-5 flex items-center gap-3">
+              <div className="grid h-10 w-10 place-items-center rounded-xl bg-gradient-to-br from-indigo-500 to-violet-500 shadow-glow">
+                <Plus size={20} />
+              </div>
+              <div>
+                <h2 className="font-display font-semibold">Start a watch party</h2>
+                <p className="text-xs text-slate-400">Create a room and invite your crew.</p>
+              </div>
+            </div>
+            <div className="space-y-3">
+              <input
+                type="text"
+                value={roomName}
+                onChange={(e) => setRoomName(e.target.value)}
+                placeholder="Room name, e.g. Friday Movie Night"
+                maxLength={100}
+                className="input"
+                required
+              />
+              <div className="grid grid-cols-2 gap-2 rounded-xl border border-white/10 bg-ink-900/60 p-1">
+                {[
+                  { value: true, label: "Private", icon: Lock },
+                  { value: false, label: "Public", icon: Globe2 },
+                ].map(({ value, label, icon: Icon }) => (
+                  <button
+                    key={label}
+                    type="button"
+                    onClick={() => setIsPrivate(value)}
+                    className={`flex items-center justify-center gap-2 rounded-lg py-2 text-sm font-medium transition-colors ${
+                      isPrivate === value ? "bg-white/10 text-white shadow" : "text-slate-400 hover:text-slate-200"
+                    }`}
+                    aria-pressed={isPrivate === value}
+                  >
+                    <Icon size={14} /> {label}
+                  </button>
+                ))}
+              </div>
+              {isPrivate ? (
+                <PasswordInput
                   value={createPassword}
                   onChange={(e) => setCreatePassword(e.target.value)}
-                  placeholder="Room Password" 
-                  className="w-full bg-slate-950 border border-slate-800 rounded-lg px-4 py-2 text-slate-200 focus:outline-none focus:ring-2 focus:ring-indigo-500 mb-4" 
-                  required
+                  placeholder="Room password"
+                  maxLength={100}
+                  autoComplete="new-password"
                 />
-                <button type="submit" className="w-full bg-indigo-600 hover:bg-indigo-500 py-2 rounded-lg font-medium transition-colors">
-                  Create New Room
-                </button>
-              </form>
-            </>
-          ) : (
-            <>
-              <h2 className="text-xl font-semibold mb-2">Add Friend</h2>
-              <p className="text-slate-400 mb-4 text-sm">Send a request by email address.</p>
-              <form onSubmit={handleSendFriendRequest}>
-                <input 
-                  type="email" 
-                  value={friendEmail}
-                  onChange={(e) => setFriendEmail(e.target.value)}
-                  placeholder="friend@example.com" 
-                  className="w-full bg-slate-950 border border-slate-800 rounded-lg px-4 py-2 text-slate-200 focus:outline-none focus:ring-2 focus:ring-indigo-500 mb-4" 
-                />
-                <button type="submit" className="w-full bg-indigo-600 hover:bg-indigo-500 py-2 rounded-lg font-medium transition-colors flex justify-center items-center gap-2">
-                  <UserPlus size={18} /> Send Request
-                </button>
-              </form>
-            </>
-          )}
-        </div>
-        
-        {/* Main Content Area */}
-        <div className="md:col-span-2 bg-slate-900 border border-slate-800 p-6 rounded-2xl">
-          {activeTab === 'rooms' && (
-            <>
-              <h2 className="text-xl font-semibold mb-4">Join Room</h2>
-              <div className="bg-slate-950 border border-slate-800 p-6 rounded-xl max-w-md mx-auto mt-8">
-                <p className="text-slate-400 mb-6 text-center text-sm">Enter a Room ID and Password to join a private watch party.</p>
-                <form onSubmit={handleJoinRoom} className="space-y-4">
-                  <div>
-                    <label className="block text-sm font-medium text-slate-400 mb-1">Room ID</label>
-                    <input 
-                      type="text" 
-                      value={joinRoomId}
-                      onChange={(e) => setJoinRoomId(e.target.value)}
-                      placeholder="e.g. c7f4fa11-..." 
-                      className="w-full bg-slate-900 border border-slate-700 rounded-lg px-4 py-3 text-slate-200 focus:outline-none focus:ring-2 focus:ring-indigo-500" 
-                      required
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-sm font-medium text-slate-400 mb-1">Password</label>
-                    <input 
-                      type="password" 
-                      value={joinPassword}
-                      onChange={(e) => setJoinPassword(e.target.value)}
-                      placeholder="••••••••" 
-                      className="w-full bg-slate-900 border border-slate-700 rounded-lg px-4 py-3 text-slate-200 focus:outline-none focus:ring-2 focus:ring-indigo-500" 
-                      required
-                    />
-                  </div>
-                  <button type="submit" className="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-medium py-3 rounded-lg transition-colors mt-2">
-                    Join Room
-                  </button>
-                </form>
-              </div>
-            </>
-          )}
-          {activeTab === 'friends' && (
-            <>
-              <h2 className="text-xl font-semibold mb-4">Your Friends</h2>
-              {friends.length === 0 ? (
-                <div className="text-slate-400 text-sm flex items-center justify-center h-32 border border-dashed border-slate-800 rounded-lg">
-                  You haven't added any friends yet.
-                </div>
               ) : (
-                <div className="space-y-4">
-                  {friends.map((friend) => (
-                    <div key={friend.id} className="flex items-center justify-between bg-slate-950 p-4 rounded-xl border border-slate-800">
-                      <div>
-                        <h3 className="font-semibold text-lg">{friend.user.name}</h3>
-                        <p className="text-sm text-slate-400">{friend.user.email}</p>
+                <p className="px-1 text-xs text-slate-400">Public rooms appear under “Live now” for everyone.</p>
+              )}
+              <button type="submit" disabled={isCreating || !roomName.trim()} className="btn-primary w-full">
+                {isCreating ? <Spinner className="h-4 w-4" /> : <MonitorPlay size={16} />} Create room
+              </button>
+            </div>
+          </form>
+
+          {/* Join */}
+          <form onSubmit={handleJoinRoom} className="card p-6 animate-fade-up [animation-delay:60ms]">
+            <div className="mb-5 flex items-center gap-3">
+              <div className="grid h-10 w-10 place-items-center rounded-xl border border-white/10 bg-white/5">
+                <LogIn size={18} />
+              </div>
+              <div>
+                <h2 className="font-display font-semibold">Join with a code</h2>
+                <p className="text-xs text-slate-400">Paste a room code like WT-1234 or an invite link.</p>
+              </div>
+            </div>
+            <div className="space-y-3">
+              <input
+                type="text"
+                value={joinCode}
+                onChange={(e) => {
+                  setJoinCode(e.target.value);
+                  setNeedsJoinPassword(false);
+                }}
+                placeholder="WT-1234"
+                className="input font-mono uppercase tracking-wider placeholder:normal-case placeholder:tracking-normal"
+                required
+              />
+              {needsJoinPassword && (
+                <div className="animate-fade-up">
+                  <PasswordInput
+                    value={joinPassword}
+                    onChange={(e) => setJoinPassword(e.target.value)}
+                    placeholder="Room password"
+                    autoFocus
+                  />
+                </div>
+              )}
+              <button type="submit" disabled={isJoining || !joinCode.trim()} className="btn-secondary w-full">
+                {isJoining ? <Spinner className="h-4 w-4" /> : <KeyRound size={16} />} Join room
+              </button>
+            </div>
+          </form>
+        </section>
+
+        <div className="mb-5 flex gap-1 overflow-x-auto rounded-xl border border-white/5 bg-white/[0.02] p-1 sm:w-fit">
+          {tabs.map(({ id, label, icon: Icon, badge }) => (
+            <button
+              key={id}
+              onClick={() => {
+                setActiveTab(id);
+                if (id === "history") fetchHistory();
+                if (id === "live") fetchPublicRooms();
+                if (id === "friends") fetchFriends();
+              }}
+              className={`flex items-center gap-2 whitespace-nowrap rounded-lg px-4 py-2 text-sm font-medium transition-colors ${
+                activeTab === id ? "bg-white/10 text-white" : "text-slate-400 hover:text-slate-200"
+              }`}
+            >
+              <Icon size={16} /> {label}
+              {badge ? (
+                <span className={`rounded-full px-1.5 text-[10px] font-bold ${id === "friends" ? "bg-fuchsia-500 text-white" : "bg-white/10 text-slate-300"}`}>
+                  {badge}
+                </span>
+              ) : null}
+            </button>
+          ))}
+        </div>
+
+        {activeTab === "live" && (
+          <section className="animate-fade-in">
+            <div className="mb-4 flex items-center justify-between">
+              <p className="text-sm text-slate-400">Public rooms that are open right now.</p>
+              <button onClick={fetchPublicRooms} className="btn-ghost px-2.5 py-1.5 text-xs">
+                <RefreshCw size={14} /> Refresh
+              </button>
+            </div>
+            {loading.live ? (
+              <SkeletonGrid />
+            ) : publicRooms.length === 0 ? (
+              <EmptyState icon={Globe2} title="No public rooms live" body="Start a public room and it will show up here for everyone." />
+            ) : (
+              <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+                {publicRooms.map((room) => (
+                  <button
+                    key={room.id}
+                    onClick={() => navigate(`/room/${room.id}`)}
+                    className="card group p-5 text-left transition-all hover:-translate-y-0.5 hover:border-indigo-400/30 hover:bg-white/[0.05]"
+                  >
+                    <div className="mb-4 flex items-center justify-between">
+                      <span className="chip border-emerald-500/30 bg-emerald-500/10 text-emerald-300">
+                        <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-emerald-400" /> Live
+                      </span>
+                      <span className="font-mono text-xs text-slate-500">{room.displayId}</span>
+                    </div>
+                    <h3 className="truncate font-display text-lg font-semibold text-white">{room.name}</h3>
+                    <div className="mt-3 flex items-center justify-between text-xs text-slate-400">
+                      <span className="flex items-center gap-2">
+                        <Avatar name={room.host.name} seed={room.hostId} size={22} /> {room.host.name}
+                      </span>
+                      <span className="flex items-center gap-1">
+                        <Users size={13} /> {room._count?.participants ?? 0}
+                      </span>
+                    </div>
+                  </button>
+                ))}
+              </div>
+            )}
+          </section>
+        )}
+
+        {activeTab === "friends" && (
+          <section className="grid gap-4 animate-fade-in lg:grid-cols-3">
+            <form onSubmit={handleSendFriendRequest} className="card h-fit p-5">
+              <h3 className="font-display font-semibold">Add a friend</h3>
+              <p className="mb-4 mt-1 text-xs text-slate-400">Send a request using their account email.</p>
+              <input
+                type="email"
+                value={friendEmail}
+                onChange={(e) => setFriendEmail(e.target.value)}
+                placeholder="friend@example.com"
+                className="input mb-3"
+              />
+              <button type="submit" disabled={isSendingRequest || !friendEmail.trim()} className="btn-primary w-full">
+                {isSendingRequest ? <Spinner className="h-4 w-4" /> : <UserPlus size={16} />} Send request
+              </button>
+            </form>
+
+            <div className="space-y-4 lg:col-span-2">
+              {incomingRequests.length > 0 && (
+                <div className="card p-5">
+                  <h3 className="mb-3 text-xs font-semibold uppercase tracking-wide text-fuchsia-300">Requests for you</h3>
+                  <div className="space-y-2">
+                    {incomingRequests.map((friend) => (
+                      <FriendRow key={friend.id} friend={friend}>
+                        <button onClick={() => handleAcceptFriendRequest(friend.id)} className="btn-primary px-3 py-1.5 text-xs">
+                          <Check size={14} /> Accept
+                        </button>
+                        <button onClick={() => handleRemoveFriend(friend, "Request declined")} className="btn-ghost px-2 py-1.5" title="Decline" aria-label="Decline">
+                          <X size={16} />
+                        </button>
+                      </FriendRow>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              <div className="card p-5">
+                <h3 className="mb-3 text-xs font-semibold uppercase tracking-wide text-slate-400">
+                  Friends {acceptedFriends.length > 0 && `· ${acceptedFriends.length}`}
+                </h3>
+                {loading.friends ? (
+                  <div className="grid h-24 place-items-center text-slate-500"><Spinner /></div>
+                ) : acceptedFriends.length === 0 && outgoingRequests.length === 0 ? (
+                  <EmptyState icon={Users} title="No friends yet" body="Add friends by email to invite them into rooms with one click." compact />
+                ) : (
+                  <div className="space-y-2">
+                    {acceptedFriends.map((friend) => (
+                      <FriendRow key={friend.id} friend={friend}>
+                        <button onClick={() => handleRemoveFriend(friend, "Friend removed")} className="btn-ghost px-2 py-1.5 text-slate-500 hover:text-red-300" title="Remove friend" aria-label="Remove friend">
+                          <UserMinus size={16} />
+                        </button>
+                      </FriendRow>
+                    ))}
+                    {outgoingRequests.map((friend) => (
+                      <FriendRow key={friend.id} friend={friend}>
+                        <span className="chip border-white/10 bg-white/5 text-slate-400">Pending</span>
+                        <button onClick={() => handleRemoveFriend(friend, "Request cancelled")} className="btn-ghost px-2 py-1.5" title="Cancel request" aria-label="Cancel request">
+                          <X size={16} />
+                        </button>
+                      </FriendRow>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+          </section>
+        )}
+
+        {activeTab === "history" && (
+          <section className="animate-fade-in">
+            <div className="relative mb-4 max-w-sm">
+              <Search size={16} className="pointer-events-none absolute left-3.5 top-1/2 -translate-y-1/2 text-slate-500" />
+              <input
+                value={historyFilter}
+                onChange={(e) => setHistoryFilter(e.target.value)}
+                placeholder="Search rooms, codes or hosts"
+                className="input pl-10"
+              />
+            </div>
+            {loading.history ? (
+              <SkeletonGrid />
+            ) : filteredHistory.length === 0 ? (
+              <EmptyState
+                icon={History}
+                title={roomHistory.length === 0 ? "No rooms yet" : "No matches"}
+                body={roomHistory.length === 0 ? "Rooms you create or join will show up here." : "Try a different search."}
+              />
+            ) : (
+              <div className="card divide-y divide-white/5">
+                {filteredHistory.map((room) => {
+                  const isHost = room.hostId === user.id;
+                  const participants = room._count?.participants ?? 0;
+                  const isLive = room.isActive && participants > 0;
+                  return (
+                    <div key={room.id} className="flex flex-col gap-3 p-4 sm:flex-row sm:items-center sm:justify-between">
+                      <div className="min-w-0">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <h3 className="truncate font-semibold text-white">{room.name}</h3>
+                          {isLive ? (
+                            <span className="chip border-emerald-500/30 bg-emerald-500/10 text-emerald-300">
+                              <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-emerald-400" /> {participants} watching
+                            </span>
+                          ) : (
+                            <span className="chip border-white/10 bg-white/5 text-slate-400">Idle</span>
+                          )}
+                          {room.isPrivate && <Lock size={13} className="text-slate-500" aria-label="Private" />}
+                          {isHost && <Crown size={13} className="text-amber-400" aria-label="You host this room" />}
+                        </div>
+                        <p className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-slate-400">
+                          {room.displayId && (
+                            <button
+                              onClick={() => handleCopy(room.id, room.displayId!)}
+                              className="inline-flex items-center gap-1 font-mono text-slate-300 hover:text-white"
+                              title="Copy room code"
+                            >
+                              {room.displayId} {copiedId === room.id ? <Check size={12} className="text-emerald-400" /> : <Copy size={12} />}
+                            </button>
+                          )}
+                          <span>Host: {isHost ? "You" : room.host.name}</span>
+                          <span>Visited {timeAgo(room.visitedAt ?? room.createdAt)}</span>
+                        </p>
                       </div>
-                      <div className="flex items-center gap-3">
-                        {friend.status === 'ACCEPTED' ? (
-                          <span className="text-sm bg-green-500/10 text-green-400 px-3 py-1 rounded-full border border-green-500/20 flex items-center gap-1">
-                            <Check size={14} /> Friends
-                          </span>
-                        ) : friend.isSender ? (
-                          <span className="text-sm bg-slate-800 text-slate-400 px-3 py-1 rounded-full border border-slate-700">
-                            Request Sent
-                          </span>
+                      <div className="flex shrink-0 items-center gap-2">
+                        <button onClick={() => navigate(`/room/${room.id}`)} className="btn-primary px-4 py-2 text-xs">
+                          {isLive ? "Join" : "Open"}
+                        </button>
+                        {isHost && isLive && (
+                          <button onClick={() => handleEndRoom(room.id)} className="btn-danger px-3 py-2 text-xs">
+                            End
+                          </button>
+                        )}
+                        {isHost ? (
+                          <button onClick={() => handleDeleteRoom(room.id)} className="btn-ghost px-2 py-2 hover:text-red-300" title="Delete room" aria-label="Delete room">
+                            <Trash2 size={16} />
+                          </button>
                         ) : (
-                          <button 
-                            onClick={() => handleAcceptFriendRequest(friend.id)}
-                            className="text-sm bg-indigo-600 hover:bg-indigo-500 text-white px-4 py-2 rounded-lg font-medium transition-colors"
-                          >
-                            Accept Request
+                          <button onClick={() => handleForgetRoom(room.id)} className="btn-ghost px-2 py-2" title="Remove from history" aria-label="Remove from history">
+                            <X size={16} />
                           </button>
                         )}
                       </div>
                     </div>
-                  ))}
-                </div>
-              )}
-            </>
-          )}
-          {activeTab === 'history' && (
-            <>
-              <h2 className="text-xl font-semibold mb-4">Room History</h2>
-              {roomHistory.length === 0 ? (
-                <div className="text-slate-400 text-sm flex items-center justify-center h-32 border border-dashed border-slate-800 rounded-lg">
-                  No rooms found. Create or join a room to see it here.
-                </div>
-              ) : (
-                <div className="space-y-4 max-h-[60vh] overflow-y-auto pr-2">
-                  {roomHistory.map((room) => {
-                    const isHost = room.hostId === user.id;
-                    return (
-                      <div key={room.id} className="flex flex-col sm:flex-row items-start sm:items-center justify-between bg-slate-950 p-4 rounded-xl border border-slate-800 gap-4">
-                        <div>
-                          <div className="flex items-center gap-2 mb-1">
-                            <h3 className="font-semibold text-lg">{room.displayId ? `Room ID: ${room.displayId} — ` : ''}{room.name}</h3>
-                            <span className={`text-xs px-2 py-0.5 rounded-full border ${room.isActive ? 'bg-green-500/10 text-green-400 border-green-500/20' : 'bg-slate-800 text-slate-400 border-slate-700'}`}>
-                              {room.isActive ? 'Active' : 'Ended'}
-                            </span>
-                          </div>
-                          <p className="text-sm text-slate-400">
-                            Host: {isHost ? 'You' : room.host.name} • {new Date(room.createdAt).toLocaleDateString()}
-                          </p>
-                        </div>
-                        <div className="flex items-center gap-2 w-full sm:w-auto">
-                          {room.isActive && (
-                            <button 
-                              onClick={() => navigate(`/room/${room.id}`)}
-                              className="flex-1 sm:flex-none text-sm bg-indigo-600 hover:bg-indigo-500 text-white px-4 py-2 rounded-lg font-medium transition-colors"
-                            >
-                              Join
-                            </button>
-                          )}
-                          {isHost && room.isActive && (
-                            <button 
-                              onClick={() => handleEndRoom(room.id)}
-                              className="flex-1 sm:flex-none text-sm bg-red-600/20 hover:bg-red-600/40 text-red-400 px-4 py-2 rounded-lg font-medium border border-red-900/50 transition-colors"
-                            >
-                              End
-                            </button>
-                          )}
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
-            </>
-          )}
+                  );
+                })}
+              </div>
+            )}
+          </section>
+        )}
+      </main>
+    </div>
+  );
+}
+
+function FriendRow({ friend, children }: { friend: Friend; children: React.ReactNode }) {
+  return (
+    <div className="flex items-center justify-between gap-3 rounded-xl border border-white/5 bg-ink-900/50 p-3">
+      <div className="flex min-w-0 items-center gap-3">
+        <Avatar name={friend.user.name} seed={friend.user.id} />
+        <div className="min-w-0">
+          <p className="truncate text-sm font-medium text-white">{friend.user.name}</p>
+          <p className="truncate text-xs text-slate-500">{friend.user.email}</p>
         </div>
       </div>
+      <div className="flex shrink-0 items-center gap-1.5">{children}</div>
+    </div>
+  );
+}
+
+function EmptyState({ icon: Icon, title, body, compact = false }: { icon: typeof Globe2; title: string; body: string; compact?: boolean }) {
+  return (
+    <div className={`flex flex-col items-center justify-center rounded-2xl border border-dashed border-white/10 text-center ${compact ? "py-8" : "py-16"}`}>
+      <div className="mb-3 grid h-12 w-12 place-items-center rounded-2xl bg-white/5 text-slate-400">
+        <Icon size={22} />
+      </div>
+      <p className="font-medium text-slate-200">{title}</p>
+      <p className="mt-1 max-w-xs text-sm text-slate-500">{body}</p>
+    </div>
+  );
+}
+
+function SkeletonGrid() {
+  return (
+    <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+      {[0, 1, 2].map((i) => (
+        <div key={i} className="h-32 animate-pulse rounded-2xl border border-white/5 bg-white/[0.03]" />
+      ))}
     </div>
   );
 }

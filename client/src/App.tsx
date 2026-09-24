@@ -1,22 +1,74 @@
-import { BrowserRouter, Routes, Route } from "react-router-dom";
+import { useEffect, type ReactNode } from "react";
+import { BrowserRouter, Routes, Route, Navigate, useLocation } from "react-router-dom";
 import Home from "./pages/Home";
 import Login from "./pages/Login";
 import Signup from "./pages/Signup";
 import Dashboard from "./pages/Dashboard";
 import Room from "./pages/Room";
+import NotFound from "./pages/NotFound";
+import Toaster from "./components/ui/Toaster";
+import { useAuthStore } from "./store/useAuthStore";
+import { useSocketStore } from "./store/useSocketStore";
+import api from "./lib/api";
+
+function RequireAuth({ children }: { children: ReactNode }) {
+  const user = useAuthStore((s) => s.user);
+  const location = useLocation();
+  if (!user) {
+    return <Navigate to="/login" replace state={{ from: location.pathname }} />;
+  }
+  return <>{children}</>;
+}
+
+function GuestOnly({ children }: { children: ReactNode }) {
+  const user = useAuthStore((s) => s.user);
+  const location = useLocation();
+  if (user) {
+    const from = (location.state as { from?: string } | null)?.from;
+    return <Navigate to={from || "/dashboard"} replace />;
+  }
+  return <>{children}</>;
+}
+
+function SessionSync() {
+  const token = useAuthStore((s) => s.token);
+
+  // Validate the stored token once and pick up profile changes.
+  useEffect(() => {
+    if (!token) return;
+    api
+      .get("/auth/me")
+      .then((res) => useAuthStore.getState().setUser(res.data.user))
+      .catch(() => {
+        /* 401s are handled by the api interceptor */
+      });
+  }, [token]);
+
+  // Drop the realtime connection when the user signs out.
+  useEffect(() => {
+    if (!token) {
+      useSocketStore.getState().disconnect();
+    }
+  }, [token]);
+
+  return null;
+}
 
 function App() {
   return (
     <BrowserRouter>
-      <div className="min-h-screen bg-slate-950 text-slate-50 font-sans selection:bg-indigo-500/30">
+      <SessionSync />
+      <div className="min-h-screen bg-ink-950 font-sans text-slate-50">
         <Routes>
           <Route path="/" element={<Home />} />
-          <Route path="/login" element={<Login />} />
-          <Route path="/signup" element={<Signup />} />
-          <Route path="/dashboard" element={<Dashboard />} />
-          <Route path="/room/:id" element={<Room />} />
+          <Route path="/login" element={<GuestOnly><Login /></GuestOnly>} />
+          <Route path="/signup" element={<GuestOnly><Signup /></GuestOnly>} />
+          <Route path="/dashboard" element={<RequireAuth><Dashboard /></RequireAuth>} />
+          <Route path="/room/:id" element={<RequireAuth><Room /></RequireAuth>} />
+          <Route path="*" element={<NotFound />} />
         </Routes>
       </div>
+      <Toaster />
     </BrowserRouter>
   );
 }

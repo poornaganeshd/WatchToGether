@@ -288,7 +288,7 @@ export const joinRoom = async (req: AuthRequest, res: Response): Promise<void> =
       : false;
 
     if (!isHost && !isCoHost && !(await verifyRoomPassword(room.password, password))) {
-      res.status(401).json({ error: password ? "Incorrect password" : "Password required" });
+      res.status(403).json({ error: password ? "Incorrect password" : "Password required" });
       return;
     }
 

@@ -144,6 +144,7 @@ export default function VideoGrid({ localStream, screenStream, peers, peerStatus
   
   const { activeSpeakers } = useAudioStore();
   const { socket } = useSocketStore();
+  const participants = useSocketStore((s) => s.participants);
 
   const handleToggleAudio = () => {
     toggleAudio();
@@ -258,7 +259,7 @@ export default function VideoGrid({ localStream, screenStream, peers, peerStatus
         isMicOn:
           peerStatuses[p.socketId]?.mic ??
           p.stream.getAudioTracks().some((t) => t.enabled && t.readyState === "live"),
-        name: `Participant ${p.socketId.slice(0, 4)}`,
+        name: participants[p.socketId]?.userName ?? `Participant ${p.socketId.slice(0, 4)}`,
       })),
   ];
 
@@ -345,7 +346,7 @@ export default function VideoGrid({ localStream, screenStream, peers, peerStatus
               <div key={s.id} className="flex items-center justify-between p-3 bg-slate-800/30 border border-slate-800 rounded-lg hover:bg-slate-800/80 transition-colors">
                 <div className="flex items-center gap-3">
                   <div className={`w-2 h-2 rounded-full shadow-[0_0_8px_rgba(0,0,0,0.5)] ${s.isActive ? 'bg-green-500 animate-pulse shadow-green-500/50' : 'bg-slate-600'}`} />
-                  <span className="text-slate-200 font-medium text-sm">{s.isLocal ? (s.id === 'screen' ? 'Your Screen' : 'You') : `Participant ${s.id.slice(0,4)}`}</span>
+                  <span className="text-slate-200 font-medium text-sm">{s.isLocal ? (s.id === 'screen' ? 'Your Screen' : 'You') : s.name}</span>
                 </div>
                 <div className="flex items-center gap-3 text-slate-400">
                   {s.isMicOn ? <Mic size={16} className="text-slate-300" /> : <MicOff size={16} className="text-red-400" />}

@@ -1,6 +1,7 @@
 import { useAudioStore } from '../store/useAudioStore';
 import type { DuckingSpeed, AudioMode } from '../store/useAudioStore';
-import { X, Volume2, Settings2 } from 'lucide-react';
+import { Volume2, Settings2 } from 'lucide-react';
+import Modal from './ui/Modal';
 
 interface Props {
   isOpen: boolean;
@@ -10,21 +11,17 @@ interface Props {
 export default function AudioSettingsModal({ isOpen, onClose }: Props) {
   const { settings, updateSettings } = useAudioStore();
 
-  if (!isOpen) return null;
-
   return (
-    <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
-      <div className="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-md shadow-2xl overflow-hidden">
-        <div className="p-4 border-b border-slate-800 flex justify-between items-center bg-slate-900/80">
-          <h2 className="text-xl font-bold flex items-center gap-2">
-            <Settings2 size={20} className="text-indigo-400" />
-            Audio Settings
-          </h2>
-          <button onClick={onClose} className="text-slate-400 hover:text-white transition-colors">
-            <X size={20} />
-          </button>
-        </div>
-
+    <Modal
+      isOpen={isOpen}
+      onClose={onClose}
+      title={
+        <span className="flex items-center gap-2">
+          <Settings2 size={18} className="text-indigo-300" />
+          Audio settings
+        </span>
+      }
+    >
         <div className="p-6 space-y-6 max-h-[80vh] overflow-y-auto">
           {/* Global Toggle */}
           <div className="flex items-center justify-between">
@@ -48,7 +45,7 @@ export default function AudioSettingsModal({ isOpen, onClose }: Props) {
                     <button
                       key={mode}
                       onClick={() => updateSettings({ audioMode: mode })}
-                      className={`p-2 rounded-lg border text-sm capitalize font-medium transition-all ${settings.audioMode === mode ? 'bg-indigo-600/20 border-indigo-500 text-indigo-300' : 'bg-slate-950 border-slate-800 text-slate-400 hover:bg-slate-800'}`}
+                      className={`p-2 rounded-lg border text-sm capitalize font-medium transition-all ${settings.audioMode === mode ? 'bg-indigo-600/20 border-indigo-500 text-indigo-300' : 'bg-white/[0.03] border-white/10 text-slate-400 hover:bg-white/[0.07]'}`}
                     >
                       {mode}
                     </button>
@@ -123,7 +120,6 @@ export default function AudioSettingsModal({ isOpen, onClose }: Props) {
             </>
           )}
         </div>
-      </div>
-    </div>
+    </Modal>
   );
 }
