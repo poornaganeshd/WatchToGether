@@ -2,6 +2,8 @@ import { Response } from "express";
 import { PrismaClient } from "@prisma/client";
 import { AuthRequest } from "../middlewares/authMiddleware";
 import { findUserByEmail } from "./auth";
+import { presence } from "../managers/PresenceManager";
+import { RoomManager } from "../managers/RoomManager";
 
 const prisma = new PrismaClient();
 
@@ -16,22 +18,43 @@ export const getFriends = async (req: AuthRequest, res: Response): Promise<void>
         ]
       },
       include: {
-        user: { select: { id: true, name: true, email: true } },
-        friendUser: { select: { id: true, name: true, email: true } }
+        user: { select: { id: true, name: true, email: true, avatarUpdatedAt: true } },
+        friendUser: { select: { id: true, name: true, email: true, avatarUpdatedAt: true } }
       }
     });
     
+    const roomManager = req.app.get("roomManager") as RoomManager | undefined;
+    const liveRoomIds = new Map<string, string>(); // friend userId -> roomId
+
     // Normalize format
     const formattedFriends = friends.map(f => {
       const isSender = f.userId === userId;
-      const otherUser = isSender ? f.friendUser : f.user;
+      const { avatarUpdatedAt, ...otherUser } = isSender ? f.friendUser : f.user;
+      const accepted = f.status === "ACCEPTED";
+      // Presence is only shared between accepted friends.
+      const roomId = accepted ? roomManager?.getUserRoomId(otherUser.id) : undefined;
+      if (roomId) liveRoomIds.set(otherUser.id, roomId);
       return {
         id: f.id,
         status: f.status, // PENDING, ACCEPTED
         isSender,
-        user: otherUser
+        user: { ...otherUser, avatarVersion: avatarUpdatedAt ? avatarUpdatedAt.getTime() : null },
+        online: accepted && presence.isOnline(otherUser.id),
+        room: null as null | { id: string; name: string; displayId: string | null; isPrivate: boolean },
       };
     });
+
+    if (liveRoomIds.size > 0) {
+      const rooms = await prisma.room.findMany({
+        where: { id: { in: Array.from(new Set(liveRoomIds.values())) } },
+        select: { id: true, name: true, displayId: true, isPrivate: true },
+      });
+      const byId = new Map(rooms.map((r) => [r.id, r]));
+      for (const f of formattedFriends) {
+        const roomId = liveRoomIds.get(f.user.id);
+        f.room = roomId ? byId.get(roomId) ?? null : null;
+      }
+    }
 
     res.status(200).json({ friends: formattedFriends });
   } catch (error) {

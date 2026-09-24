@@ -106,6 +106,18 @@ export const queueMoveSchema = queueItemSchema.extend({
   direction: z.enum(["up", "down"]),
 });
 
+export const subtitlesSchema = z.object({
+  roomId: z.string().uuid(),
+  label: z.string().trim().min(1).max(100),
+  vtt: z.string().startsWith("WEBVTT"),
+});
+
+export const playbackReportSchema = z.object({
+  roomId: z.string().uuid(),
+  state: z.enum(["synced", "drifting", "buffering", "error"]),
+  drift: z.number().finite().min(-86400).max(86400),
+});
+
 export const validateSocketPayload = <T>(schema: z.ZodType<T>, data: unknown, socket: Socket): T | null => {
   const result = schema.safeParse(data);
   if (!result.success) {

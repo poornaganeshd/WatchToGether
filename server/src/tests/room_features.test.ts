@@ -97,6 +97,9 @@ async function runTests() {
   const otherRoomId = "88888888-8888-4888-a888-000000000002";
   await prisma.message.deleteMany({ where: { roomId: { in: [privateRoomId, otherRoomId] } } });
   await prisma.roomCoHost.deleteMany({ where: { roomId: { in: [privateRoomId, otherRoomId] } } });
+  // Queue items and bans are persisted, so clear leftovers from earlier runs.
+  await prisma.roomQueueItem.deleteMany({ where: { roomId: { in: [privateRoomId, otherRoomId] } } });
+  await prisma.roomBan.deleteMany({ where: { roomId: { in: [privateRoomId, otherRoomId] } } });
   await prisma.room.upsert({
     where: { id: privateRoomId },
     update: { isActive: true, hostId, password: hashed, isPrivate: true },
@@ -246,7 +249,54 @@ async function runTests() {
     assert(pos >= 14.9 && pos <= 15.5, "Playing position is extrapolated from the last update", String(pos));
     assert(roomManager.getCurrentPlaybackTime({ playing: false, time: 10, url: "", lastUpdatedAt: now - 5000 }) === 10, "Paused position is unchanged");
 
-    console.log("\n--- Test 16: Evicting a room notifies everyone ---");
+    console.log("\n--- Test 16: Subtitles ---");
+    // The outsider was removed earlier, so it is no longer in the room.
+    outsider.socket.emit("subtitles_set", { roomId: privateRoomId, label: "Nope", vtt: "WEBVTT\n\n" });
+    await wait(300);
+    assert(!roomManager.getRoom(privateRoomId)?.subtitles, "People outside the room cannot set subtitles");
+    host.socket.emit("subtitles_set", { roomId: privateRoomId, label: "English", vtt: "WEBVTT\n\n00:00.000 --> 00:02.000\nHello" });
+    await wait(300);
+    assert(guest.last("subtitles_updated")?.label === "English", "Subtitles are shared with the room");
+
+    console.log("\n--- Test 17: Viewer sync reports ---");
+    guest.socket.emit("playback_report", { roomId: privateRoomId, state: "buffering", drift: 2.345 });
+    await wait(300);
+    const report = host.last("viewer_sync");
+    assert(report?.socketId === guest.socket.id && report.state === "buffering" && report.drift === 2.3, "Host receives rounded sync reports", report);
+
+    console.log("\n--- Test 18: Vote to skip ---");
+    for (const item of [...roomManager.getQueue(privateRoomId)]) {
+      host.socket.emit("queue_remove", { roomId: privateRoomId, itemId: item.id });
+    }
+    await wait(300);
+    host.socket.emit("queue_add", { roomId: privateRoomId, url: "https://example.com/next.mp4" });
+    await wait(300);
+    const persistedQueue = await (async () => {
+      await new Promise((r) => setTimeout(r, 200));
+      return prisma.roomQueueItem.findMany({ where: { roomId: privateRoomId } });
+    })();
+    assert(persistedQueue.some((q) => q.url === "https://example.com/next.mp4"), "Queue items are saved to the database");
+
+    // host + guest in the room -> 2 votes needed
+    guest.socket.emit("vote_skip", { roomId: privateRoomId });
+    await wait(300);
+    const votes = host.last("skip_votes");
+    assert(votes?.count === 1 && votes.needed === 2, "Votes are counted against a majority", votes);
+    guest.socket.emit("vote_skip", { roomId: privateRoomId });
+    await wait(300);
+    assert(host.last("skip_votes")?.count === 0, "Voting again withdraws the vote");
+    guest.socket.emit("vote_skip", { roomId: privateRoomId });
+    host.socket.emit("vote_skip", { roomId: privateRoomId });
+    await wait(400);
+    const nextUrl = roomManager.getRoom(privateRoomId)?.playback.url;
+    assert(!!guest.last("skip_passed") && nextUrl === "https://example.com/next.mp4", "Majority vote plays the next queued video");
+    assert(guest.last("subtitles_updated") === null, "Changing video clears subtitles");
+    assert(host.last("skip_votes")?.count === 0, "Votes reset for the new video");
+    guest.socket.emit("vote_skip", { roomId: privateRoomId });
+    await wait(300);
+    assert(guest.last("error")?.message === "Nothing is queued to skip to", "Can't vote to skip with an empty queue");
+
+    console.log("\n--- Test 19: Evicting a room notifies everyone ---");
     roomManager.evictRoom(privateRoomId);
     await wait(300);
     assert(guest.last("room_ended")?.roomId === privateRoomId, "Participants receive room_ended");

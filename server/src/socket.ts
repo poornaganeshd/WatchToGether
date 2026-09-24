@@ -1,10 +1,11 @@
 import { Server, Socket } from "socket.io";
 import { PrismaClient } from "@prisma/client";
-import jwt from "jsonwebtoken";
+import { verifyAuthToken } from "./middlewares/authMiddleware";
 import { RoomManager } from "./managers/RoomManager";
 import * as schemas from "./schemas/socketSchemas";
 import { verifyRoomPassword } from "./utils/roomPassword";
 import { randomUUID } from "crypto";
+import { presence } from "./managers/PresenceManager";
 
 const prisma = new PrismaClient();
 
@@ -32,6 +33,26 @@ const createLimiter = (max: number, windowMs: number) => {
 };
 
 const chatLimiter = createLimiter(8, 5000);
+const syncReportLimiter = createLimiter(20, 10000);
+const voteLimiter = createLimiter(10, 10000);
+
+const MAX_SUBTITLE_CHARS = 350_000;
+
+/** Tells a user's accepted friends to refresh their presence view. */
+const notifyFriendsOfPresence = async (io: Server, userId: string) => {
+  try {
+    const links = await prisma.friend.findMany({
+      where: { status: "ACCEPTED", OR: [{ userId }, { friendId: userId }] },
+      select: { userId: true, friendId: true },
+    });
+    for (const link of links) {
+      const friendId = link.userId === userId ? link.friendId : link.userId;
+      io.to(`user_${friendId}`).emit("presence_changed", { userId });
+    }
+  } catch (err) {
+    console.error("Failed to notify friends of presence:", err);
+  }
+};
 const reactionLimiter = createLimiter(10, 3000);
 const queueLimiter = createLimiter(5, 10000);
 
@@ -42,23 +63,32 @@ export const setupSocketHandlers = (io: Server, gracePeriodOrManager?: number | 
       : new RoomManager(io, typeof gracePeriodOrManager === "number" ? gracePeriodOrManager : 10000);
 
   // Authentication Middleware
-  io.use((socket, next) => {
+  io.use(async (socket, next) => {
     const token = socket.handshake.auth?.token;
     if (!token) {
       return next(new Error("Authentication error: No token provided"));
     }
-    try {
-      const decoded = jwt.verify(token, process.env.JWT_SECRET as string) as { userId: string };
-      socket.data.userId = decoded.userId;
-      next();
-    } catch (err) {
-      next(new Error("Authentication error: Invalid token"));
+    const userId = await verifyAuthToken(token);
+    if (!userId) {
+      return next(new Error("Authentication error: Invalid token"));
     }
+    socket.data.userId = userId;
+    next();
   });
 
   io.on("connection", (socket: Socket) => {
     const userId = socket.data.userId;
     console.log(`User connected: ${userId} (Socket: ${socket.id})`);
+    if (presence.add(userId, socket.id)) {
+      notifyFriendsOfPresence(io, userId);
+    }
+
+    // Broadcasts per-video state that resets when the video changes.
+    const emitVideoScopedState = (roomId: string) => {
+      const room = roomManager.getRoom(roomId);
+      io.to(roomId).emit("subtitles_updated", room?.subtitles ?? null);
+      io.to(roomId).emit("skip_votes", roomManager.getSkipState(roomId));
+    };
 
     socket.on("join_global_room", (data) => {
       const payload = schemas.validateSocketPayload(schemas.joinGlobalRoomSchema, data, socket);
@@ -125,10 +155,11 @@ export const setupSocketHandlers = (io: Server, gracePeriodOrManager?: number | 
         }
 
         // Prefer the account name over whatever the client sent.
-        const dbUser = await prisma.user.findUnique({ where: { id: userId }, select: { name: true } });
+        const dbUser = await prisma.user.findUnique({ where: { id: userId }, select: { name: true, avatarUpdatedAt: true } });
+        const avatarVersion = dbUser?.avatarUpdatedAt?.getTime() ?? null;
         const displayName = dbUser?.name || userName;
 
-        const success = await roomManager.handleJoin(roomId, socket.id, userId, displayName);
+        const success = await roomManager.handleJoin(roomId, socket.id, userId, displayName, avatarVersion);
         if (!success) {
           socket.emit("error", { message: "Room not found" });
           return;
@@ -144,12 +175,17 @@ export const setupSocketHandlers = (io: Server, gracePeriodOrManager?: number | 
           socket.emit("sync_response", { ...room.playback, serverTime: Date.now() });
           socket.emit("room_state", { hostId: room.hostId, coHosts: Array.from(room.coHosts), startedAt: room.startedAt });
           socket.emit("queue_updated", room.queue);
+          socket.emit("subtitles_updated", room.subtitles);
+          socket.emit("viewer_sync_all", roomManager.getSyncReports(roomId));
           socket.emit("room_participant_statuses", roomManager.getParticipantStatuses(roomId));
           socket.emit("room_participants", roomManager.getParticipants(roomId));
         }
 
         // Broadcast to room that a user joined
-        socket.to(roomId).emit("user_joined", { userId, userName: displayName, socketId: socket.id });
+        socket.to(roomId).emit("user_joined", { userId, userName: displayName, socketId: socket.id, avatarVersion });
+        // The skip threshold depends on how many people are here.
+        io.to(roomId).emit("skip_votes", roomManager.getSkipState(roomId));
+        notifyFriendsOfPresence(io, userId);
 
         try {
           const recent = await prisma.message.findMany({
@@ -233,6 +269,10 @@ export const setupSocketHandlers = (io: Server, gracePeriodOrManager?: number | 
 
       socket.leave(payload.roomId);
       await roomManager.handleLeave(payload.roomId, socket.id, userId);
+      if (roomManager.getRoom(payload.roomId)) {
+        io.to(payload.roomId).emit("skip_votes", roomManager.getSkipState(payload.roomId));
+      }
+      notifyFriendsOfPresence(io, userId);
       if (typeof callback === "function") {
         callback();
       }
@@ -297,8 +337,67 @@ export const setupSocketHandlers = (io: Server, gracePeriodOrManager?: number | 
       if (senderRoomId !== payload.roomId) return;
       if (!roomManager.isAuthorized(senderRoomId, userId)) return;
 
-      roomManager.updatePlayback(senderRoomId, { url: payload.url, time: 0 });
+      const changed = roomManager.updatePlayback(senderRoomId, { url: payload.url, time: 0 });
       socket.to(senderRoomId).emit("change_video", { url: payload.url });
+      if (changed) emitVideoScopedState(senderRoomId);
+    });
+
+    // --- VOTE TO SKIP ---
+    socket.on("vote_skip", (data) => {
+      const p = schemas.validateSocketPayload(schemas.roomOnlySchema, data, socket);
+      if (!p) return;
+      const senderRoomId = roomManager.getSocketRoomId(socket.id);
+      if (senderRoomId !== p.roomId || !voteLimiter.allow(socket.id)) return;
+      const next = roomManager.getQueue(senderRoomId)[0];
+      if (!next) {
+        socket.emit("error", { message: "Nothing is queued to skip to" });
+        return;
+      }
+      roomManager.toggleSkipVote(senderRoomId, userId);
+      const state = roomManager.getSkipState(senderRoomId);
+      if (state.count >= state.needed) {
+        roomManager.removeFromQueue(senderRoomId, next.id);
+        io.to(senderRoomId).emit("skip_passed", { count: state.count });
+        playUrlForRoom(senderRoomId, next.url);
+        io.to(senderRoomId).emit("queue_updated", roomManager.getQueue(senderRoomId));
+      } else {
+        io.to(senderRoomId).emit("skip_votes", state);
+      }
+    });
+
+    // --- SUBTITLES ---
+    socket.on("subtitles_set", (data) => {
+      const p = schemas.validateSocketPayload(schemas.subtitlesSchema, data, socket);
+      if (!p) return;
+      const senderRoomId = roomManager.getSocketRoomId(socket.id);
+      if (senderRoomId !== p.roomId || !roomManager.isAuthorized(senderRoomId, userId)) return;
+      if (p.vtt.length > MAX_SUBTITLE_CHARS) {
+        socket.emit("error", { message: "Subtitle file is too large" });
+        return;
+      }
+      roomManager.setSubtitles(senderRoomId, { label: p.label, vtt: p.vtt });
+      io.to(senderRoomId).emit("subtitles_updated", { label: p.label, vtt: p.vtt });
+    });
+
+    socket.on("subtitles_clear", (data) => {
+      const p = schemas.validateSocketPayload(schemas.roomOnlySchema, data, socket);
+      if (!p) return;
+      const senderRoomId = roomManager.getSocketRoomId(socket.id);
+      if (senderRoomId !== p.roomId || !roomManager.isAuthorized(senderRoomId, userId)) return;
+      roomManager.setSubtitles(senderRoomId, null);
+      io.to(senderRoomId).emit("subtitles_updated", null);
+    });
+
+    // --- VIEWER SYNC STATUS ---
+    socket.on("playback_report", (data) => {
+      const p = schemas.validateSocketPayload(schemas.playbackReportSchema, data, socket);
+      if (!p) return;
+      const senderRoomId = roomManager.getSocketRoomId(socket.id);
+      if (senderRoomId !== p.roomId || !syncReportLimiter.allow(socket.id)) return;
+      const report = { state: p.state, drift: Math.round(p.drift * 10) / 10 };
+      if (roomManager.reportSync(senderRoomId, socket.id, report)) {
+        socket.to(senderRoomId).emit("viewer_sync", { socketId: socket.id, ...report });
+      }
     });
 
     socket.on("request_sync", (data) => {
@@ -385,11 +484,12 @@ export const setupSocketHandlers = (io: Server, gracePeriodOrManager?: number | 
       io.to(roomId).emit("queue_updated", roomManager.getQueue(roomId));
     };
 
-    const playUrlForRoom = (roomId: string, url: string) => {
+    function playUrlForRoom(roomId: string, url: string) {
       roomManager.updatePlayback(roomId, { url, time: 0, playing: true });
       io.to(roomId).emit("change_video", { url });
       io.to(roomId).emit("play_video", { time: 0, serverTime: Date.now() });
-    };
+      emitVideoScopedState(roomId);
+    }
 
     socket.on("queue_add", (data) => {
       const p = schemas.validateSocketPayload(schemas.queueAddSchema, data, socket);
@@ -560,6 +660,11 @@ export const setupSocketHandlers = (io: Server, gracePeriodOrManager?: number | 
     socket.on("disconnect", () => {
       console.log("User disconnected:", socket.id);
       chatLimiter.forget(socket.id);
+      syncReportLimiter.forget(socket.id);
+      voteLimiter.forget(socket.id);
+      if (presence.remove(userId, socket.id)) {
+        notifyFriendsOfPresence(io, userId);
+      }
       reactionLimiter.forget(socket.id);
       queueLimiter.forget(socket.id);
       roomManager.handleDisconnect(socket.id);

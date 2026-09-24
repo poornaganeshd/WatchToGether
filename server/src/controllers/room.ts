@@ -2,17 +2,14 @@ import { Response } from "express";
 import { PrismaClient } from "@prisma/client";
 import { z } from "zod";
 import { AuthRequest } from "../middlewares/authMiddleware";
-import nodemailer from "nodemailer";
-import { RoomManager } from "../managers/RoomManager";
+import { getClientUrl, getMailTransport, mailFrom } from "../utils/mailer";
+import { RoomManager, flushRoomWrites } from "../managers/RoomManager";
 import { hashRoomPassword, verifyRoomPassword } from "../utils/roomPassword";
 import { escapeHtml } from "../utils/escapeHtml";
 import { findUserByEmail } from "./auth";
 
 const prisma = new PrismaClient();
 
-// Read lazily: this module is imported before dotenv runs in index.ts.
-const getClientUrl = () =>
-  (process.env.CLIENT_URL || "http://localhost:5173").split(",")[0].trim().replace(/\/+$/, "");
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 // Never expose the stored password (hashed or not) to clients.
@@ -26,15 +23,25 @@ const publicRoomSelect = {
   hostId: true,
   isActive: true,
   createdAt: true,
+  scheduledFor: true,
   host: { select: { name: true } },
   _count: { select: { participants: true } },
 } as const;
+
+const MAX_SCHEDULE_AHEAD_MS = 365 * 24 * 60 * 60 * 1000;
+const scheduleSchema = z
+  .string()
+  .datetime({ offset: true, message: "Invalid date" })
+  .transform((v) => new Date(v))
+  .refine((d) => d.getTime() > Date.now() - 60_000, "Pick a time in the future")
+  .refine((d) => d.getTime() < Date.now() + MAX_SCHEDULE_AHEAD_MS, "Pick a time within the next year");
 
 const createRoomSchema = z.object({
   name: z.string().trim().min(1, "Room name is required").max(100, "Room name is too long"),
   description: z.string().trim().max(500, "Description is too long").optional(),
   isPrivate: z.boolean().optional(),
   password: z.string().max(100, "Password is too long").optional(),
+  scheduledFor: scheduleSchema.optional(),
 });
 
 const updateRoomSchema = z.object({
@@ -43,6 +50,7 @@ const updateRoomSchema = z.object({
   // Omit to keep the current password.
   password: z.string().max(100, "Password is too long").optional(),
   maxParticipants: z.number().int().min(2, "Rooms need room for at least 2 people").max(50, "Rooms are limited to 50 people").optional(),
+  scheduledFor: scheduleSchema.nullable().optional(),
 });
 
 const inviteSchema = z.object({
@@ -64,16 +72,30 @@ const findRoomByAnyId = (rawId: string) => {
   return prisma.room.findUnique({ where: { displayId } });
 };
 
-const getMailTransport = () => {
-  const { SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS } = process.env;
-  if (!SMTP_HOST || !SMTP_USER || !SMTP_PASS) return null;
-  const port = Number(SMTP_PORT) || 587;
-  return nodemailer.createTransport({
-    host: SMTP_HOST,
-    port,
-    secure: port === 465,
-    auth: { user: SMTP_USER, pass: SMTP_PASS },
+
+const acceptedFriendIds = async (userId: string) => {
+  const links = await prisma.friend.findMany({
+    where: { status: "ACCEPTED", OR: [{ userId }, { friendId: userId }] },
+    select: { userId: true, friendId: true },
   });
+  return links.map((l) => (l.userId === userId ? l.friendId : l.userId));
+};
+
+const notifyFriendsOfSchedule = async (req: AuthRequest, roomId: string, roomName: string, hostName: string, when: Date) => {
+  try {
+    const io = req.app.get("io");
+    if (!io) return;
+    for (const friendId of await acceptedFriendIds(req.userId!)) {
+      io.to(`user_${friendId}`).emit("notification", {
+        title: "Watch party scheduled",
+        body: `${hostName} scheduled "${roomName}"`,
+        roomId,
+        scheduledFor: when.toISOString(),
+      });
+    }
+  } catch (err) {
+    console.error("Failed to notify friends of schedule:", err);
+  }
 };
 
 export const createRoom = async (req: AuthRequest, res: Response): Promise<void> => {
@@ -89,7 +111,7 @@ export const createRoom = async (req: AuthRequest, res: Response): Promise<void>
       res.status(400).json({ error: parsed.error.issues[0].message });
       return;
     }
-    const { name, description, isPrivate, password } = parsed.data;
+    const { name, description, isPrivate, password, scheduledFor } = parsed.data;
     const trimmedPassword = password?.trim() || null;
 
     if (isPrivate && !trimmedPassword) {
@@ -119,9 +141,14 @@ export const createRoom = async (req: AuthRequest, res: Response): Promise<void>
         isPrivate: !!isPrivate,
         password: isPrivate && trimmedPassword ? await hashRoomPassword(trimmedPassword) : null,
         hostId,
+        scheduledFor: scheduledFor ?? null,
       },
       select: publicRoomSelect,
     });
+
+    if (scheduledFor) {
+      await notifyFriendsOfSchedule(req, room.id, room.name, room.host.name, scheduledFor);
+    }
 
     res.status(201).json({ room });
   } catch (error) {
@@ -234,7 +261,7 @@ export const inviteRoom = async (req: AuthRequest, res: Response): Promise<void>
       const safeRoom = escapeHtml(room.name);
       try {
         await transporter.sendMail({
-          from: process.env.SMTP_FROM || '"WatchTogether" <noreply@watchtogether.app>',
+          from: mailFrom(),
           to: email,
           subject: `${user.name} invited you to watch together!`,
           text: `Hello!\n\n${user.name} invited you to join the room "${room.name}"${room.displayId ? ` (${room.displayId})` : ""}.\n\nJoin here: ${inviteLink}\n\nHave fun!`,
@@ -392,7 +419,7 @@ export const updateRoom = async (req: AuthRequest, res: Response): Promise<void>
       return;
     }
 
-    const { name, isPrivate, password, maxParticipants } = parsed.data;
+    const { name, isPrivate, password, maxParticipants, scheduledFor } = parsed.data;
     const nextPrivate = isPrivate ?? room.isPrivate;
     const trimmedPassword = password?.trim();
 
@@ -413,12 +440,16 @@ export const updateRoom = async (req: AuthRequest, res: Response): Promise<void>
         isPrivate: nextPrivate,
         ...(nextPassword !== undefined ? { password: nextPassword } : {}),
         ...(maxParticipants !== undefined ? { maxParticipants } : {}),
+        ...(scheduledFor !== undefined ? { scheduledFor } : {}),
       },
       select: publicRoomSelect,
     });
 
     const roomManager = req.app.get("roomManager") as RoomManager | undefined;
     roomManager?.updateSettings(id, { maxParticipants: updated.maxParticipants });
+    if (scheduledFor && scheduledFor.getTime() !== room.scheduledFor?.getTime()) {
+      await notifyFriendsOfSchedule(req, id, updated.name, updated.host.name, scheduledFor);
+    }
     req.app.get("io")?.to(id).emit("room_updated", {
       name: updated.name,
       isPrivate: updated.isPrivate,
@@ -428,6 +459,76 @@ export const updateRoom = async (req: AuthRequest, res: Response): Promise<void>
     res.status(200).json({ room: updated });
   } catch (error) {
     console.error("Update Room Error:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+};
+
+// Watch parties scheduled by you or your friends, from a few hours ago onward.
+export const getUpcomingRooms = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const userId = req.userId!;
+    const hostIds = [userId, ...(await acceptedFriendIds(userId))];
+    const rooms = await prisma.room.findMany({
+      where: {
+        hostId: { in: hostIds },
+        scheduledFor: { gte: new Date(Date.now() - 3 * 60 * 60 * 1000) },
+      },
+      select: publicRoomSelect,
+      orderBy: { scheduledFor: "asc" },
+      take: 50,
+    });
+    res.status(200).json({ rooms });
+  } catch (error) {
+    console.error("Get Upcoming Rooms Error:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+};
+
+const requireHost = async (req: AuthRequest, res: Response) => {
+  const room = await prisma.room.findUnique({ where: { id: req.params.id as string }, select: { id: true, hostId: true } });
+  if (!room) {
+    res.status(404).json({ error: "Room not found" });
+    return null;
+  }
+  if (room.hostId !== req.userId) {
+    res.status(403).json({ error: "Forbidden: Only the host can manage removed participants" });
+    return null;
+  }
+  return room;
+};
+
+export const getRoomBans = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const room = await requireHost(req, res);
+    if (!room) return;
+    // Bans are written in the background; make sure recent ones are visible.
+    await flushRoomWrites(room.id);
+    const bans = await prisma.roomBan.findMany({
+      where: { roomId: room.id },
+      include: { user: { select: { id: true, name: true, email: true } } },
+      orderBy: { createdAt: "desc" },
+    });
+    res.status(200).json({ bans: bans.map((b) => ({ user: b.user, createdAt: b.createdAt })) });
+  } catch (error) {
+    console.error("Get Room Bans Error:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+};
+
+export const unbanUser = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const room = await requireHost(req, res);
+    if (!room) return;
+    const roomManager = req.app.get("roomManager") as RoomManager | undefined;
+    await flushRoomWrites(room.id);
+    if (roomManager) {
+      await roomManager.unbanUser(room.id, req.params.userId as string);
+    } else {
+      await prisma.roomBan.deleteMany({ where: { roomId: room.id, userId: req.params.userId as string } });
+    }
+    res.status(200).json({ message: "User can rejoin" });
+  } catch (error) {
+    console.error("Unban Error:", error);
     res.status(500).json({ error: "Internal server error" });
   }
 };
