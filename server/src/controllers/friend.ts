@@ -1,9 +1,9 @@
 import { Response } from "express";
 import { PrismaClient } from "@prisma/client";
+import { notifyUser } from "../infra/notify";
 import { AuthRequest } from "../middlewares/authMiddleware";
 import { findUserByEmail } from "./auth";
 import { presence } from "../managers/PresenceManager";
-import { RoomManager } from "../managers/RoomManager";
 
 const prisma = new PrismaClient();
 
@@ -23,26 +23,26 @@ export const getFriends = async (req: AuthRequest, res: Response): Promise<void>
       }
     });
     
-    const roomManager = req.app.get("roomManager") as RoomManager | undefined;
     const liveRoomIds = new Map<string, string>(); // friend userId -> roomId
 
-    // Normalize format
-    const formattedFriends = friends.map(f => {
+    // Presence is only shared between accepted friends.
+    const formattedFriends = await Promise.all(friends.map(async (f) => {
       const isSender = f.userId === userId;
       const { avatarUpdatedAt, ...otherUser } = isSender ? f.friendUser : f.user;
       const accepted = f.status === "ACCEPTED";
-      // Presence is only shared between accepted friends.
-      const roomId = accepted ? roomManager?.getUserRoomId(otherUser.id) : undefined;
+      const [online, roomId] = accepted
+        ? await Promise.all([presence.isOnline(otherUser.id), presence.getRoom(otherUser.id)])
+        : [false, null];
       if (roomId) liveRoomIds.set(otherUser.id, roomId);
       return {
         id: f.id,
         status: f.status, // PENDING, ACCEPTED
         isSender,
         user: { ...otherUser, avatarVersion: avatarUpdatedAt ? avatarUpdatedAt.getTime() : null },
-        online: accepted && presence.isOnline(otherUser.id),
+        online,
         room: null as null | { id: string; name: string; displayId: string | null; isPrivate: boolean },
       };
-    });
+    }));
 
     if (liveRoomIds.size > 0) {
       const rooms = await prisma.room.findMany({
@@ -100,7 +100,7 @@ export const sendFriendRequest = async (req: AuthRequest, res: Response): Promis
         const accepter = await prisma.user.findUnique({ where: { id: userId } });
         const io = req.app.get("io");
         if (io && accepter) {
-          io.to(`user_${targetUser.id}`).emit("notification", {
+          void notifyUser(io, targetUser.id, {
             title: "Friend Request Accepted",
             body: `${accepter.name} accepted your friend request!`
           });
@@ -123,7 +123,7 @@ export const sendFriendRequest = async (req: AuthRequest, res: Response): Promis
     const senderUser = await prisma.user.findUnique({ where: { id: userId } });
     const io = req.app.get("io");
     if (io && senderUser) {
-      io.to(`user_${targetUser.id}`).emit("notification", {
+      void notifyUser(io, targetUser.id, {
         title: "New Friend Request",
         body: `${senderUser.name} sent you a friend request!`
       });
@@ -159,7 +159,7 @@ export const acceptFriendRequest = async (req: AuthRequest, res: Response): Prom
     const accepterUser = await prisma.user.findUnique({ where: { id: userId } });
     const io = req.app.get("io");
     if (io && accepterUser) {
-      io.to(`user_${friend.userId}`).emit("notification", {
+      void notifyUser(io, friend.userId, {
         title: "Friend Request Accepted",
         body: `${accepterUser.name} accepted your friend request!`
       });

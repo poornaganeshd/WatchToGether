@@ -1,4 +1,5 @@
 import { PrismaClient } from "@prisma/client";
+import { notifyUser } from "../infra/notify";
 import { Server } from "socket.io";
 
 const prisma = new PrismaClient();
@@ -34,13 +35,13 @@ export const runReminderSweep = async (io: Server): Promise<string[]> => {
     });
     const friendIds = links.map((l) => (l.userId === room.hostId ? l.friendId : l.userId));
 
-    io.to(`user_${room.hostId}`).emit("notification", {
+    void notifyUser(io, room.hostId, {
       title: "Your watch party is starting",
       body: `"${room.name}" is scheduled to start now. Your friends have been reminded.`,
       roomId: room.id,
     });
     for (const friendId of friendIds) {
-      io.to(`user_${friendId}`).emit("notification", {
+      void notifyUser(io, friendId, {
         title: "Watch party starting",
         body: `${room.host.name}'s "${room.name}" is starting now`,
         roomId: room.id,

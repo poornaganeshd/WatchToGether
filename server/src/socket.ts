@@ -6,6 +6,9 @@ import * as schemas from "./schemas/socketSchemas";
 import { verifyRoomPassword } from "./utils/roomPassword";
 import { randomUUID } from "crypto";
 import { presence } from "./managers/PresenceManager";
+import { hasPasswordBypass } from "./controllers/inviteLinks";
+import { incrementWindow, peekWindow, resetWindow } from "./infra/counterStore";
+import { acquireRoomLease, releaseRoomLease, renewRoomLeases } from "./infra/roomLease";
 
 const prisma = new PrismaClient();
 
@@ -39,42 +42,21 @@ const voteLimiter = createLimiter(10, 10000);
 const MAX_SUBTITLE_CHARS = 350_000;
 
 // Counts only failed room-password attempts, so correct passwords are never throttled.
-const failedJoins = (() => {
-  const WINDOW_MS = 15 * 60 * 1000;
-  const MAX_FAILURES = 10;
-  const failures = new Map<string, { count: number; resetAt: number }>();
-  setInterval(() => {
-    const now = Date.now();
-    for (const [key, entry] of failures) if (entry.resetAt <= now) failures.delete(key);
-  }, 60_000).unref();
-  return {
-    isBlocked(key: string) {
-      const entry = failures.get(key);
-      if (!entry) return false;
-      if (entry.resetAt <= Date.now()) {
-        failures.delete(key);
-        return false;
-      }
-      return entry.count >= MAX_FAILURES;
-    },
-    recordFailure(key: string) {
-      const now = Date.now();
-      const entry = failures.get(key);
-      if (!entry || entry.resetAt <= now) failures.set(key, { count: 1, resetAt: now + WINDOW_MS });
-      else entry.count++;
-    },
-    clear(key: string) {
-      failures.delete(key);
-    },
-  };
-})();
+// Backed by the shared counter store so the limit holds across API instances.
+const FAILED_JOIN_WINDOW_MS = 15 * 60 * 1000;
+const MAX_FAILED_JOINS = 10;
+const failedJoins = {
+  isBlocked: async (key: string) => (await peekWindow(`join-fail:${key}`)) >= MAX_FAILED_JOINS,
+  recordFailure: (key: string) => incrementWindow(`join-fail:${key}`, FAILED_JOIN_WINDOW_MS),
+  clear: (key: string) => resetWindow(`join-fail:${key}`),
+};
 
 /** Disconnects every socket belonging to a user (e.g. after their password changed). */
 export const disconnectUserSockets = (io: Server | undefined, userId: string, keepSocketId?: string) => {
   if (!io) return;
-  for (const s of io.sockets.sockets.values()) {
-    if (s.data.userId === userId && s.id !== keepSocketId) s.disconnect(true);
-  }
+  // Every socket joins its user's channel on connect, so this reaches all instances via the adapter.
+  const target = keepSocketId ? io.in(`user_${userId}`).except(keepSocketId) : io.in(`user_${userId}`);
+  target.disconnectSockets(true);
 };
 
 /** Tells a user's accepted friends to refresh their presence view. */
@@ -101,6 +83,19 @@ export const setupSocketHandlers = (io: Server, gracePeriodOrManager?: number | 
       ? gracePeriodOrManager
       : new RoomManager(io, typeof gracePeriodOrManager === "number" ? gracePeriodOrManager : 10000);
 
+  presence.setLocalRoomLookup((uid) => roomManager.getUserRoomId(uid));
+  const presenceHeartbeat = setInterval(() => {
+    presence.heartbeat().catch((err) => console.error("Presence heartbeat failed:", err));
+  }, 20_000);
+  presenceHeartbeat.unref();
+  const leaseRenewal = setInterval(() => {
+    renewRoomLeases(roomManager.getRoomIds()).catch((err) => console.error("Room lease renewal failed:", err));
+  }, 20_000);
+  leaseRenewal.unref();
+  roomManager.onRoomClosed = (roomId) => {
+    releaseRoomLease(roomId).catch((err) => console.error("Room lease release failed:", err));
+  };
+
   // Authentication Middleware
   io.use(async (socket, next) => {
     const token = socket.handshake.auth?.token;
@@ -118,9 +113,14 @@ export const setupSocketHandlers = (io: Server, gracePeriodOrManager?: number | 
   io.on("connection", (socket: Socket) => {
     const userId = socket.data.userId;
     console.log(`User connected: ${userId} (Socket: ${socket.id})`);
-    if (presence.add(userId, socket.id)) {
-      notifyFriendsOfPresence(io, userId);
-    }
+    // Personal channel for notifications and account-wide actions (e.g. forced sign-out).
+    socket.join(`user_${userId}`);
+    presence
+      .add(userId, socket.id)
+      .then((cameOnline) => {
+        if (cameOnline) notifyFriendsOfPresence(io, userId);
+      })
+      .catch((err) => console.error("Presence update failed:", err));
 
     // Broadcasts per-video state that resets when the video changes.
     const emitVideoScopedState = (roomId: string) => {
@@ -168,28 +168,30 @@ export const setupSocketHandlers = (io: Server, gracePeriodOrManager?: number | 
         }
 
         if (roomAuth.isPrivate && roomAuth.password && roomAuth.hostId !== userId) {
-          // Co-hosts bypass the password, everyone else must supply it.
-          const cohost = await prisma.roomCoHost.findUnique({
-            where: { roomId_userId: { roomId, userId } }
-          });
-
-          if (!cohost) {
+          // Co-hosts and people who accepted an invite link skip the password.
+          if (!(await hasPasswordBypass(roomId, userId, roomAuth.hostId))) {
             if (!password) {
               socket.emit("error", { message: "Password required for private room" });
               return;
             }
             const attemptKey = `${userId}|${roomId}`;
-            if (failedJoins.isBlocked(attemptKey)) {
+            if (await failedJoins.isBlocked(attemptKey)) {
               socket.emit("error", { message: "Too many password attempts. Try again in a few minutes." });
               return;
             }
             if (!(await verifyRoomPassword(roomAuth.password, password))) {
-              failedJoins.recordFailure(attemptKey);
+              await failedJoins.recordFailure(attemptKey);
               socket.emit("error", { message: "Incorrect password" });
               return;
             }
-            failedJoins.clear(attemptKey);
+            await failedJoins.clear(attemptKey);
           }
+        }
+
+        // With several API instances, only the one that owns the room may run it.
+        if (!(await acquireRoomLease(roomId))) {
+          socket.emit("error", { message: "This room is live on another server. Please try again in a moment." });
+          return;
         }
 
         // Make sure the in-memory session exists so bans and capacity can be checked.
@@ -234,6 +236,9 @@ export const setupSocketHandlers = (io: Server, gracePeriodOrManager?: number | 
           socket.emit("subtitles_updated", room.subtitles);
           socket.emit("viewer_sync_all", roomManager.getSyncReports(roomId));
           socket.emit("recently_played", room.recentlyPlayed);
+          socket.emit("poll_updated", roomManager.viewPoll(roomId));
+          socket.emit("poll_my_vote", roomManager.getUserVote(roomId, userId));
+          socket.emit("chat_settings", roomManager.getChatSettings(roomId));
           const countdownEndsAt = roomManager.getCountdownEndsAt(roomId);
           if (countdownEndsAt) socket.emit("countdown", { endsAt: countdownEndsAt, serverTime: Date.now() });
           socket.emit("room_participant_statuses", roomManager.getParticipantStatuses(roomId));
@@ -244,6 +249,7 @@ export const setupSocketHandlers = (io: Server, gracePeriodOrManager?: number | 
         socket.to(roomId).emit("user_joined", { userId, userName: displayName, socketId: socket.id, avatarVersion });
         // The skip threshold depends on how many people are here.
         io.to(roomId).emit("skip_votes", roomManager.getSkipState(roomId));
+        await presence.setRoom(userId, roomId).catch((err) => console.error("Presence update failed:", err));
         notifyFriendsOfPresence(io, userId);
 
         try {
@@ -288,14 +294,28 @@ export const setupSocketHandlers = (io: Server, gracePeriodOrManager?: number | 
         socket.emit("chat_rate_limited", { message: "You're sending messages too quickly" });
         return;
       }
+      const blocked = roomManager.checkCanChat(roomId, userId);
+      if (blocked) {
+        socket.emit("chat_rate_limited", { message: blocked });
+        return;
+      }
 
       const userName = roomManager.getParticipantName(roomId, socket.id) || payload.userName;
       let id = `${Date.now()}-${socket.id}`;
       let createdAt = new Date().toISOString();
 
       try {
+        // Remember what was on screen so the chat can be replayed alongside the video later.
+        const room = roomManager.getRoom(roomId);
+        const videoUrl = room?.playback.url || null;
         const saved = await prisma.message.create({
-          data: { content, userId, roomId }
+          data: {
+            content,
+            userId,
+            roomId,
+            videoUrl,
+            videoTime: room && videoUrl ? roomManager.getCurrentPlaybackTime(room.playback) : null,
+          }
         });
         id = saved.id;
         createdAt = saved.createdAt.toISOString();
@@ -331,6 +351,7 @@ export const setupSocketHandlers = (io: Server, gracePeriodOrManager?: number | 
       if (roomManager.getRoom(payload.roomId)) {
         io.to(payload.roomId).emit("skip_votes", roomManager.getSkipState(payload.roomId));
       }
+      await presence.setRoom(userId, roomManager.getUserRoomId(userId) ?? null).catch((err) => console.error("Presence update failed:", err));
       notifyFriendsOfPresence(io, userId);
       if (typeof callback === "function") {
         callback();
@@ -471,6 +492,97 @@ export const setupSocketHandlers = (io: Server, gracePeriodOrManager?: number | 
         io.to(senderRoomId).emit("cohost_removed", { userId: p.targetUserId });
         io.to(senderRoomId).emit("room_state", { hostId: room.hostId, coHosts: Array.from(room.coHosts), startedAt: room.startedAt });
       }
+    });
+
+    // --- POLLS ---
+    const finishPoll = (roomId: string, pollId: string) => {
+      const poll = roomManager.getPoll(roomId);
+      const result = roomManager.closePoll(roomId, pollId);
+      if (!result || !poll) return;
+      io.to(roomId).emit("poll_updated", roomManager.viewPoll(roomId));
+      if (poll.queueWinner && result.winner !== null) {
+        const added = roomManager.addToQueue(roomId, {
+          id: randomUUID(),
+          url: poll.options[result.winner],
+          addedBy: poll.createdBy,
+          addedByName: `${poll.createdByName} (poll)`,
+        });
+        if (added) io.to(roomId).emit("queue_updated", roomManager.getQueue(roomId));
+      }
+    };
+
+    socket.on("poll_create", (data) => {
+      const p = schemas.validateSocketPayload(schemas.pollCreateSchema, data, socket);
+      if (!p) return;
+      const senderRoomId = roomManager.getSocketRoomId(socket.id);
+      if (senderRoomId !== p.roomId || !roomManager.isAuthorized(senderRoomId, userId)) return;
+      const pollId = randomUUID();
+      const created = roomManager.createPoll(
+        senderRoomId,
+        {
+          id: pollId,
+          question: p.question,
+          options: p.options,
+          createdBy: userId,
+          createdByName: roomManager.getParticipantName(senderRoomId, socket.id) || "Host",
+          queueWinner: !!p.queueWinner,
+          closesAt: p.durationSeconds ? Date.now() + p.durationSeconds * 1000 : null,
+        },
+        () => finishPoll(senderRoomId, pollId)
+      );
+      if (!created) {
+        socket.emit("error", { message: "Close the current poll before starting another" });
+        return;
+      }
+      io.to(senderRoomId).emit("poll_updated", roomManager.viewPoll(senderRoomId));
+      io.to(senderRoomId).emit("poll_my_vote", null);
+    });
+
+    socket.on("poll_vote", (data) => {
+      const p = schemas.validateSocketPayload(schemas.pollVoteSchema, data, socket);
+      if (!p) return;
+      const senderRoomId = roomManager.getSocketRoomId(socket.id);
+      if (senderRoomId !== p.roomId || !voteLimiter.allow(socket.id)) return;
+      if (roomManager.votePoll(senderRoomId, p.pollId, userId, p.option)) {
+        // Votes are anonymous: everyone sees counts, only the voter learns their own choice.
+        io.to(`user_${userId}`).emit("poll_my_vote", p.option);
+        io.to(senderRoomId).emit("poll_updated", roomManager.viewPoll(senderRoomId));
+      }
+    });
+
+    socket.on("poll_close", (data) => {
+      const p = schemas.validateSocketPayload(schemas.pollCloseSchema, data, socket);
+      if (!p) return;
+      const senderRoomId = roomManager.getSocketRoomId(socket.id);
+      if (senderRoomId !== p.roomId) return;
+      const poll = roomManager.getPoll(senderRoomId);
+      if (!poll || (poll.createdBy !== userId && !roomManager.isAuthorized(senderRoomId, userId))) return;
+      finishPoll(senderRoomId, p.pollId);
+    });
+
+    // --- MUTE & SLOW MODE ---
+    socket.on("set_slow_mode", (data) => {
+      const p = schemas.validateSocketPayload(schemas.slowModeSchema, data, socket);
+      if (!p) return;
+      const senderRoomId = roomManager.getSocketRoomId(socket.id);
+      if (senderRoomId !== p.roomId || !roomManager.isAuthorized(senderRoomId, userId)) return;
+      roomManager.setSlowMode(senderRoomId, p.seconds);
+      io.to(senderRoomId).emit("chat_settings", roomManager.getChatSettings(senderRoomId));
+    });
+
+    socket.on("mute_user", (data) => {
+      const p = schemas.validateSocketPayload(schemas.muteSchema, data, socket);
+      if (!p) return;
+      const senderRoomId = roomManager.getSocketRoomId(socket.id);
+      if (senderRoomId !== p.roomId || !roomManager.isAuthorized(senderRoomId, userId)) return;
+      const room = roomManager.getRoom(senderRoomId);
+      if (!room || p.targetUserId === userId || p.targetUserId === room.hostId) return;
+      if (room.coHosts.has(p.targetUserId) && room.hostId !== userId) {
+        socket.emit("error", { message: "Only the host can mute a co-host" });
+        return;
+      }
+      roomManager.setMuted(senderRoomId, p.targetUserId, p.minutes === 0 ? undefined : p.minutes === null ? null : Date.now() + p.minutes * 60_000);
+      io.to(senderRoomId).emit("chat_settings", roomManager.getChatSettings(senderRoomId));
     });
 
     // --- VOTE TO SKIP ---
@@ -793,9 +905,12 @@ export const setupSocketHandlers = (io: Server, gracePeriodOrManager?: number | 
       chatLimiter.forget(socket.id);
       syncReportLimiter.forget(socket.id);
       voteLimiter.forget(socket.id);
-      if (presence.remove(userId, socket.id)) {
-        notifyFriendsOfPresence(io, userId);
-      }
+      presence
+        .remove(userId, socket.id)
+        .then((wentOffline) => {
+          if (wentOffline) notifyFriendsOfPresence(io, userId);
+        })
+        .catch((err) => console.error("Presence update failed:", err));
       reactionLimiter.forget(socket.id);
       queueLimiter.forget(socket.id);
       roomManager.handleDisconnect(socket.id);

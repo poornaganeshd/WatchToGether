@@ -1,6 +1,7 @@
 import dotenv from "dotenv";
 import { PrismaClient } from "@prisma/client";
 import { startReminderScheduler } from "./managers/ReminderScheduler";
+import { initRedis } from "./infra/redis";
 
 dotenv.config();
 
@@ -27,7 +28,8 @@ const start = async () => {
     await prisma.$disconnect();
   }
 
-  const { httpServer, io } = createApp();
+  const redis = await initRedis();
+  const { httpServer, io } = createApp({ redis });
   startReminderScheduler(io);
   const PORT = process.env.PORT || 5000;
 

@@ -1,5 +1,6 @@
 import { Response } from "express";
 import { PrismaClient } from "@prisma/client";
+import { notifyUser } from "../infra/notify";
 import { z } from "zod";
 import { AuthRequest } from "../middlewares/authMiddleware";
 import { getClientUrl, getMailTransport, mailFrom } from "../utils/mailer";
@@ -7,6 +8,8 @@ import { RoomManager, flushRoomWrites } from "../managers/RoomManager";
 import { hashRoomPassword, verifyRoomPassword } from "../utils/roomPassword";
 import { escapeHtml } from "../utils/escapeHtml";
 import { findUserByEmail } from "./auth";
+import { hasPasswordBypass } from "./inviteLinks";
+import { getGroupMemberIds } from "./friendGroups";
 
 const prisma = new PrismaClient();
 
@@ -86,7 +89,7 @@ const notifyFriendsOfSchedule = async (req: AuthRequest, roomId: string, roomNam
     const io = req.app.get("io");
     if (!io) return;
     for (const friendId of await acceptedFriendIds(req.userId!)) {
-      io.to(`user_${friendId}`).emit("notification", {
+      void notifyUser(io, friendId, {
         title: "Watch party scheduled",
         body: `${hostName} scheduled "${roomName}"`,
         roomId,
@@ -97,6 +100,12 @@ const notifyFriendsOfSchedule = async (req: AuthRequest, roomId: string, roomNam
     console.error("Failed to notify friends of schedule:", err);
   }
 };
+
+/** Host, co-host, or someone who has joined the room before. */
+const isRoomMember = async (roomId: string, userId: string, hostId: string) =>
+  hostId === userId ||
+  !!(await prisma.roomCoHost.findUnique({ where: { roomId_userId: { roomId, userId } } })) ||
+  !!(await prisma.roomHistoryEntry.findUnique({ where: { userId_roomId: { userId, roomId } } }));
 
 export const createRoom = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
@@ -195,7 +204,8 @@ export const getRoomById = async (req: AuthRequest, res: Response): Promise<void
     }
 
     const { password, ...rest } = room;
-    res.status(200).json({ room: { ...rest, hasPassword: !!password } });
+    const canSkipPassword = await hasPasswordBypass(room.id, req.userId!, room.hostId);
+    res.status(200).json({ room: { ...rest, hasPassword: !!password, canSkipPassword } });
   } catch (error) {
     console.error("Get Room Error:", error);
     res.status(500).json({ error: "Internal server error" });
@@ -255,11 +265,7 @@ export const inviteRoom = async (req: AuthRequest, res: Response): Promise<void>
 
     // Only people who belong to the room can invite others to it; otherwise this endpoint
     // would let anyone make the server email arbitrary addresses.
-    const isMember =
-      room.hostId === user.id ||
-      !!(await prisma.roomCoHost.findUnique({ where: { roomId_userId: { roomId, userId: user.id } } })) ||
-      !!(await prisma.roomHistoryEntry.findUnique({ where: { userId_roomId: { userId: user.id, roomId } } }));
-    if (!isMember) {
+    if (!(await isRoomMember(roomId, user.id, room.hostId))) {
       res.status(403).json({ error: "Join this room before inviting people to it" });
       return;
     }
@@ -294,7 +300,7 @@ export const inviteRoom = async (req: AuthRequest, res: Response): Promise<void>
     const targetUser = await findUserByEmail(email);
     if (targetUser) {
       const io = req.app.get("io");
-      io?.to(`user_${targetUser.id}`).emit("notification", {
+      void notifyUser(io, targetUser.id, {
         title: "Room Invitation",
         body: `${user.name} invited you to join "${room.name}"!`,
         roomId,
@@ -329,12 +335,9 @@ export const joinRoom = async (req: AuthRequest, res: Response): Promise<void> =
       return;
     }
 
-    const isHost = room.hostId === req.userId;
-    const isCoHost = !isHost && req.userId
-      ? !!(await prisma.roomCoHost.findUnique({ where: { roomId_userId: { roomId: room.id, userId: req.userId } } }))
-      : false;
+    const bypass = await hasPasswordBypass(room.id, req.userId!, room.hostId);
 
-    if (!isHost && !isCoHost && !(await verifyRoomPassword(room.password, password))) {
+    if (!bypass && !(await verifyRoomPassword(room.password, password))) {
       res.status(403).json({ error: password ? "Incorrect password" : "Password required" });
       return;
     }
@@ -542,6 +545,113 @@ export const unbanUser = async (req: AuthRequest, res: Response): Promise<void> 
     res.status(200).json({ message: "User can rejoin" });
   } catch (error) {
     console.error("Unban Error:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+};
+
+export const inviteGroup = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const roomId = req.params.id as string;
+    const userId = req.userId!;
+    const groupId = typeof req.body?.groupId === "string" ? req.body.groupId : "";
+    const [room, user] = await Promise.all([
+      prisma.room.findUnique({ where: { id: roomId } }),
+      prisma.user.findUnique({ where: { id: userId } }),
+    ]);
+    if (!room || !user) {
+      res.status(404).json({ error: "Room not found" });
+      return;
+    }
+    if (!(await isRoomMember(roomId, userId, room.hostId))) {
+      res.status(403).json({ error: "Join this room before inviting people to it" });
+      return;
+    }
+    const memberIds = await getGroupMemberIds(userId, groupId);
+    if (!memberIds) {
+      res.status(404).json({ error: "Group not found" });
+      return;
+    }
+    const io = req.app.get("io");
+    for (const memberId of memberIds) {
+      void notifyUser(io, memberId, {
+        title: "Room Invitation",
+        body: `${user.name} invited you to join "${room.name}"!`,
+        roomId,
+      });
+    }
+    res.status(200).json({ message: `Invited ${memberIds.length} friend${memberIds.length === 1 ? "" : "s"}`, invited: memberIds.length });
+  } catch (error) {
+    console.error("Invite Group Error:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+};
+
+/** Videos in this room that have chat worth replaying. */
+export const listReplays = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const roomId = req.params.id as string;
+    const room = await prisma.room.findUnique({ where: { id: roomId }, select: { hostId: true, name: true } });
+    if (!room) {
+      res.status(404).json({ error: "Room not found" });
+      return;
+    }
+    if (!(await isRoomMember(roomId, req.userId!, room.hostId))) {
+      res.status(403).json({ error: "Only people who joined this room can see its replays" });
+      return;
+    }
+    const groups = await prisma.message.groupBy({
+      by: ["videoUrl"],
+      where: { roomId, videoUrl: { not: null }, videoTime: { not: null } },
+      _count: { _all: true },
+      _max: { createdAt: true },
+      orderBy: { _max: { createdAt: "desc" } },
+      take: 50,
+    });
+    res.status(200).json({
+      roomName: room.name,
+      replays: groups.map((g) => ({ videoUrl: g.videoUrl, messageCount: g._count._all, lastAt: g._max.createdAt })),
+    });
+  } catch (error) {
+    console.error("List Replays Error:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+};
+
+/** Chat for one video, ordered by where in the video it was sent. */
+export const getReplay = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const roomId = req.params.id as string;
+    const videoUrl = typeof req.query.url === "string" ? req.query.url : "";
+    const room = await prisma.room.findUnique({ where: { id: roomId }, select: { hostId: true, name: true } });
+    if (!room) {
+      res.status(404).json({ error: "Room not found" });
+      return;
+    }
+    if (!(await isRoomMember(roomId, req.userId!, room.hostId))) {
+      res.status(403).json({ error: "Only people who joined this room can see its replays" });
+      return;
+    }
+    const messages = await prisma.message.findMany({
+      where: { roomId, videoUrl, videoTime: { not: null } },
+      orderBy: [{ videoTime: "asc" }, { createdAt: "asc" }],
+      take: 2000,
+      include: { user: { select: { name: true, avatarUpdatedAt: true } } },
+    });
+    res.status(200).json({
+      roomName: room.name,
+      videoUrl,
+      messages: messages.map((m) => ({
+        id: m.id,
+        userId: m.userId,
+        userName: m.user.name,
+        avatarVersion: m.user.avatarUpdatedAt?.getTime() ?? null,
+        content: m.content,
+        videoTime: m.videoTime,
+        createdAt: m.createdAt,
+      })),
+    });
+  } catch (error) {
+    console.error("Get Replay Error:", error);
     res.status(500).json({ error: "Internal server error" });
   }
 };
