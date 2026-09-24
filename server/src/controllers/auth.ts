@@ -3,19 +3,46 @@ import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken";
 import { PrismaClient } from "@prisma/client";
 import { z } from "zod";
+import { AuthRequest } from "../middlewares/authMiddleware";
 
 const prisma = new PrismaClient();
 
 const registerSchema = z.object({
-  name: z.string().min(1, "Name is required").max(100, "Name is too long"),
-  email: z.string().email("Invalid email address"),
+  name: z.string().trim().min(1, "Name is required").max(100, "Name is too long"),
+  email: z.string().trim().toLowerCase().pipe(z.string().email("Invalid email address")),
   password: z.string().min(6, "Password must be at least 6 characters"),
 });
 
 const loginSchema = z.object({
-  email: z.string().email("Invalid email address"),
+  email: z.string().trim().pipe(z.string().email("Invalid email address")),
   password: z.string().min(1, "Password is required"),
 });
+
+// Emails are stored lowercased now, but older accounts may have mixed case.
+export const findUserByEmail = async (email: string) => {
+  const trimmed = email.trim();
+  return (
+    (await prisma.user.findUnique({ where: { email: trimmed.toLowerCase() } })) ??
+    (await prisma.user.findFirst({ where: { email: { equals: trimmed, mode: "insensitive" } } }))
+  );
+};
+
+export const me = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const user = await prisma.user.findUnique({
+      where: { id: req.userId! },
+      select: { id: true, email: true, name: true },
+    });
+    if (!user) {
+      res.status(401).json({ error: "Unauthorized" });
+      return;
+    }
+    res.status(200).json({ user });
+  } catch (error) {
+    console.error("Me Error:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+};
 
 export const register = async (req: Request, res: Response): Promise<void> => {
   try {
@@ -26,7 +53,7 @@ export const register = async (req: Request, res: Response): Promise<void> => {
     }
     const { email, password, name } = parsed.data;
 
-    const existingUser = await prisma.user.findUnique({ where: { email } });
+    const existingUser = await findUserByEmail(email);
     if (existingUser) {
       res.status(400).json({ error: "Email already in use" });
       return;
@@ -62,7 +89,7 @@ export const login = async (req: Request, res: Response): Promise<void> => {
     }
     const { email, password } = parsed.data;
 
-    const user = await prisma.user.findUnique({ where: { email } });
+    const user = await findUserByEmail(email);
     if (!user) {
       res.status(400).json({ error: "Invalid credentials" });
       return;

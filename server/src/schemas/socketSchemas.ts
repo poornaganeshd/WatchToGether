@@ -75,6 +75,13 @@ export const screenShareStartSchema = z.object({
   streamId: z.string(),
 });
 
+export const ALLOWED_REACTIONS = ["😂", "❤️", "🔥", "👏", "😮", "😢", "🍿", "👍"] as const;
+
+export const reactionSchema = z.object({
+  roomId: z.string().uuid(),
+  emoji: z.enum(ALLOWED_REACTIONS),
+});
+
 export const validateSocketPayload = <T>(schema: z.ZodType<T>, data: unknown, socket: Socket): T | null => {
   const result = schema.safeParse(data);
   if (!result.success) {

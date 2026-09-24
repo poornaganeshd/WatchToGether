@@ -17,15 +17,20 @@ if (!process.env.JWT_SECRET) {
 
 const app = express();
 const httpServer = createServer(app);
+// Comma-separated list of allowed origins; defaults to allowing any origin.
+const allowedOrigins = process.env.CLIENT_URL
+  ? process.env.CLIENT_URL.split(",").map((o) => o.trim().replace(/\/+$/, "")).filter(Boolean)
+  : "*";
+
 const io = new Server(httpServer, {
   cors: {
-    origin: "*",
+    origin: allowedOrigins,
     methods: ["GET", "POST"]
   }
 });
 
-app.use(cors());
-app.use(express.json());
+app.use(cors({ origin: allowedOrigins }));
+app.use(express.json({ limit: "100kb" }));
 
 app.set("io", io);
 

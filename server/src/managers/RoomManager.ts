@@ -16,6 +16,7 @@ interface RoomState {
   hostId: string;
   coHosts: Set<string>;
   participants: Map<string, string>; // socketId -> userId
+  participantNames: Map<string, string>; // socketId -> display name
   participantStatuses: Map<string, { cam: boolean; mic: boolean }>;
   playback: PlaybackState;
   disconnectedParticipants: Map<string, { userId: string; timeout: NodeJS.Timeout }>;
@@ -59,6 +60,7 @@ export class RoomManager {
           hostId: dbRoom.hostId,
           coHosts: new Set(dbRoom.coHosts.map((ch) => ch.userId)),
           participants: new Map(),
+          participantNames: new Map(),
           participantStatuses: new Map(),
           disconnectedParticipants: new Map(),
           playback: {
@@ -124,6 +126,7 @@ export class RoomManager {
         const isStillConnected = existingSocket && existingSocket.connected;
         if (!isStillConnected) {
           room.participants.delete(sId);
+          room.participantNames.delete(sId);
           room.participantStatuses.delete(sId);
           if (!staleSocketIds.includes(sId)) {
             staleSocketIds.push(sId);
@@ -138,6 +141,7 @@ export class RoomManager {
     }
 
     room.participants.set(socketId, userId);
+    room.participantNames.set(socketId, userName);
 
     // Synchronize to PostgreSQL: Ensure Room.isActive is true and participant is recorded
     let joinAttempts = 0;
@@ -177,6 +181,7 @@ export class RoomManager {
       if (room.participants.has(socketId)) {
         const userId = room.participants.get(socketId)!;
         room.participants.delete(socketId);
+        room.participantNames.delete(socketId);
         room.participantStatuses.delete(socketId);
 
         // If the user still has another active socket in the room, do not schedule removal
@@ -212,6 +217,7 @@ export class RoomManager {
     }
 
     room.participants.delete(socketId);
+    room.participantNames.delete(socketId);
     room.participantStatuses.delete(socketId);
     await this.permanentlyRemoveUser(roomId, userId, socketId);
     await this.checkAndDeactivateIfEmpty(roomId);
@@ -294,16 +300,22 @@ export class RoomManager {
     return false;
   }
 
-  public async forceEndRoom(roomId: string) {
+  // Drops the in-memory session and tells everyone in it that the room is over.
+  public evictRoom(roomId: string) {
     const room = this.rooms.get(roomId);
     if (room) {
       for (const [, data] of room.disconnectedParticipants.entries()) {
         clearTimeout(data.timeout);
       }
       room.disconnectedParticipants.clear();
-      this.io.to(roomId).emit("room_ended", { roomId });
       this.rooms.delete(roomId);
     }
+    this.io.to(roomId).emit("room_ended", { roomId });
+    this.io.in(roomId).socketsLeave(roomId);
+  }
+
+  public async forceEndRoom(roomId: string) {
+    this.evictRoom(roomId);
     try {
       await prisma.room.update({
         where: { id: roomId },
@@ -388,6 +400,20 @@ export class RoomManager {
     const room = this.rooms.get(roomId);
     if (!room) return;
     room.participantStatuses.set(socketId, { cam, mic });
+  }
+
+  public getParticipantName(roomId: string, socketId: string): string | undefined {
+    return this.rooms.get(roomId)?.participantNames.get(socketId);
+  }
+
+  public getParticipants(roomId: string): { socketId: string; userId: string; userName: string }[] {
+    const room = this.rooms.get(roomId);
+    if (!room) return [];
+    return Array.from(room.participants.entries()).map(([socketId, userId]) => ({
+      socketId,
+      userId,
+      userName: room.participantNames.get(socketId) ?? "Guest",
+    }));
   }
 
   public getParticipantStatuses(roomId: string): Record<string, { cam: boolean; mic: boolean }> {

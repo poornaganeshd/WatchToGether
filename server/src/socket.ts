@@ -3,8 +3,35 @@ import { PrismaClient } from "@prisma/client";
 import jwt from "jsonwebtoken";
 import { RoomManager } from "./managers/RoomManager";
 import * as schemas from "./schemas/socketSchemas";
+import { verifyRoomPassword } from "./utils/roomPassword";
 
 const prisma = new PrismaClient();
+
+const CHAT_HISTORY_LIMIT = 50;
+
+// Sliding-window limiter keyed by socket id.
+const createLimiter = (max: number, windowMs: number) => {
+  const hits = new Map<string, number[]>();
+  return {
+    allow(key: string) {
+      const now = Date.now();
+      const recent = (hits.get(key) || []).filter((t) => now - t < windowMs);
+      if (recent.length >= max) {
+        hits.set(key, recent);
+        return false;
+      }
+      recent.push(now);
+      hits.set(key, recent);
+      return true;
+    },
+    forget(key: string) {
+      hits.delete(key);
+    },
+  };
+};
+
+const chatLimiter = createLimiter(8, 5000);
+const reactionLimiter = createLimiter(10, 3000);
 
 export const setupSocketHandlers = (io: Server, gracePeriodOrManager?: number | RoomManager) => {
   const roomManager =
@@ -61,35 +88,36 @@ export const setupSocketHandlers = (io: Server, gracePeriodOrManager?: number | 
           return;
         }
 
-        if (roomAuth.isPrivate) {
-          // Only require password if the user is not the host
-          if (roomAuth.hostId !== userId) {
-            // Check if user is a co-host, they bypass password
-            const cohost = await prisma.roomCoHost.findUnique({
-              where: { roomId_userId: { roomId, userId } }
-            });
+        if (roomAuth.isPrivate && roomAuth.password && roomAuth.hostId !== userId) {
+          // Co-hosts bypass the password, everyone else must supply it.
+          const cohost = await prisma.roomCoHost.findUnique({
+            where: { roomId_userId: { roomId, userId } }
+          });
 
-            if (!cohost) {
-              if (!password) {
-                socket.emit("error", { message: "Password required for private room" });
-                return;
-              }
-              if (roomAuth.password && roomAuth.password !== password) {
-                socket.emit("error", { message: "Incorrect password" });
-                return;
-              }
+          if (!cohost) {
+            if (!password) {
+              socket.emit("error", { message: "Password required for private room" });
+              return;
+            }
+            if (!(await verifyRoomPassword(roomAuth.password, password))) {
+              socket.emit("error", { message: "Incorrect password" });
+              return;
             }
           }
         }
 
-        const success = await roomManager.handleJoin(roomId, socket.id, userId, userName);
+        // Prefer the account name over whatever the client sent.
+        const dbUser = await prisma.user.findUnique({ where: { id: userId }, select: { name: true } });
+        const displayName = dbUser?.name || userName;
+
+        const success = await roomManager.handleJoin(roomId, socket.id, userId, displayName);
         if (!success) {
           socket.emit("error", { message: "Room not found" });
           return;
         }
 
         socket.join(roomId);
-        console.log(`User ${userName} (${userId}) joined room ${roomId} on socket ${socket.id}`);
+        console.log(`User ${displayName} (${userId}) joined room ${roomId} on socket ${socket.id}`);
 
         const room = roomManager.getRoom(roomId);
 
@@ -98,10 +126,33 @@ export const setupSocketHandlers = (io: Server, gracePeriodOrManager?: number | 
           socket.emit("sync_response", { ...room.playback, serverTime: Date.now() });
           socket.emit("room_state", { hostId: room.hostId, coHosts: Array.from(room.coHosts) });
           socket.emit("room_participant_statuses", roomManager.getParticipantStatuses(roomId));
+          socket.emit("room_participants", roomManager.getParticipants(roomId));
         }
 
         // Broadcast to room that a user joined
-        socket.to(roomId).emit("user_joined", { userId, userName, socketId: socket.id });
+        socket.to(roomId).emit("user_joined", { userId, userName: displayName, socketId: socket.id });
+
+        try {
+          const recent = await prisma.message.findMany({
+            where: { roomId },
+            orderBy: { createdAt: "desc" },
+            take: CHAT_HISTORY_LIMIT,
+            include: { user: { select: { name: true } } },
+          });
+          socket.emit(
+            "chat_history",
+            recent.reverse().map((m) => ({
+              id: m.id,
+              roomId: m.roomId,
+              userId: m.userId,
+              userName: m.user.name,
+              content: m.content,
+              createdAt: m.createdAt.toISOString(),
+            }))
+          );
+        } catch (historyErr) {
+          console.error("Failed to load chat history:", historyErr);
+        }
       } catch (err) {
         console.error("Error in join_room:", err);
         socket.emit("error", { message: "Internal server error joining room" });
@@ -111,29 +162,49 @@ export const setupSocketHandlers = (io: Server, gracePeriodOrManager?: number | 
     socket.on("send_message", async (data) => {
       const payload = schemas.validateSocketPayload(schemas.sendMessageSchema, data, socket);
       if (!payload) return;
-      
-      const { roomId, userName, content } = payload;
-      
-      if (payload.userId !== userId) return; // Ignore spoofed
 
-      const messageData = {
-        id: Date.now().toString(),
-        roomId,
-        userId,
-        userName,
-        content, // Length validation done by zod (max 1000). React safely renders text.
-        createdAt: new Date().toISOString()
-      };
-      
-      io.to(roomId).emit("receive_message", messageData);
+      const { roomId } = payload;
+      const content = payload.content.trim();
+      if (payload.userId !== userId || !content) return; // Ignore spoofed or blank
+
+      const senderRoomId = roomManager.getSocketRoomId(socket.id);
+      if (senderRoomId !== roomId) return;
+
+      if (!chatLimiter.allow(socket.id)) {
+        socket.emit("chat_rate_limited", { message: "You're sending messages too quickly" });
+        return;
+      }
+
+      const userName = roomManager.getParticipantName(roomId, socket.id) || payload.userName;
+      let id = `${Date.now()}-${socket.id}`;
+      let createdAt = new Date().toISOString();
 
       try {
-        await prisma.message.create({
+        const saved = await prisma.message.create({
           data: { content, userId, roomId }
         });
+        id = saved.id;
+        createdAt = saved.createdAt.toISOString();
       } catch (err) {
         console.error("Error saving message:", err);
       }
+
+      // React renders this as text, so no HTML escaping is needed here.
+      io.to(roomId).emit("receive_message", { id, roomId, userId, userName, content, createdAt });
+    });
+
+    socket.on("send_reaction", (data) => {
+      const p = schemas.validateSocketPayload(schemas.reactionSchema, data, socket);
+      if (!p) return;
+      const senderRoomId = roomManager.getSocketRoomId(socket.id);
+      if (senderRoomId !== p.roomId) return;
+      if (!reactionLimiter.allow(socket.id)) return;
+      io.to(senderRoomId).emit("reaction", {
+        socketId: socket.id,
+        userId,
+        userName: roomManager.getParticipantName(senderRoomId, socket.id) || "Someone",
+        emoji: p.emoji,
+      });
     });
 
     socket.on("leave_room", async (data, callback?: () => void) => {
@@ -238,9 +309,9 @@ export const setupSocketHandlers = (io: Server, gracePeriodOrManager?: number | 
         return;
       }
       
-      const targetSocket = io.sockets.sockets.get(payload.targetSocketId);
-      const targetUserId = targetSocket?.data?.userId;
-      if (!targetUserId) return;
+      // The target must actually be in this room; otherwise anyone could be promoted.
+      const targetUserId = room.participants.get(payload.targetSocketId);
+      if (!targetUserId || targetUserId === room.hostId) return;
 
       const success = await roomManager.makeCoHost(senderRoomId, targetUserId);
       if (success) {
@@ -348,6 +419,8 @@ export const setupSocketHandlers = (io: Server, gracePeriodOrManager?: number | 
 
     socket.on("disconnect", () => {
       console.log("User disconnected:", socket.id);
+      chatLimiter.forget(socket.id);
+      reactionLimiter.forget(socket.id);
       roomManager.handleDisconnect(socket.id);
     });
   });
