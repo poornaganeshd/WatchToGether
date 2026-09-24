@@ -60,7 +60,11 @@ interface RoomState {
   skipVotes: Set<string>; // userIds voting to skip the current video
   participantSync: Map<string, { state: SyncState; drift: number }>; // socketId -> report
   participantAvatars: Map<string, number | null>; // socketId -> avatar version
+  recentlyPlayed: { url: string; playedAt: number }[];
+  countdown: { endsAt: number; timer: NodeJS.Timeout } | null;
 }
+
+const MAX_RECENTLY_PLAYED = 20;
 
 export class RoomManager {
   private rooms: Map<string, RoomState> = new Map();
@@ -121,6 +125,8 @@ export class RoomManager {
           skipVotes: new Set(),
           participantSync: new Map(),
           participantAvatars: new Map(),
+          recentlyPlayed: [],
+          countdown: null,
           playback: {
             playing: false,
             time: dbRoom.playbackTime ?? 0,
@@ -336,6 +342,10 @@ export class RoomManager {
     const hasDisconnected = room.disconnectedParticipants.size > 0;
 
     if (!hasActive && !hasDisconnected) {
+      if (room.countdown) {
+        clearTimeout(room.countdown.timer);
+        room.countdown = null;
+      }
       let attempts = 0;
       while (attempts < 3) {
         try {
@@ -376,6 +386,7 @@ export class RoomManager {
         clearTimeout(data.timeout);
       }
       room.disconnectedParticipants.clear();
+      if (room.countdown) clearTimeout(room.countdown.timer);
       this.rooms.delete(roomId);
     }
     this.io.to(roomId).emit("room_ended", { roomId });
@@ -581,8 +592,57 @@ export class RoomManager {
       room.subtitles = null;
       room.skipVotes.clear();
       room.participantSync.clear();
+      if (room.playback.url) {
+        room.recentlyPlayed = [
+          { url: room.playback.url, playedAt: Date.now() },
+          ...room.recentlyPlayed.filter((r) => r.url !== room.playback.url),
+        ].slice(0, MAX_RECENTLY_PLAYED);
+      }
     }
     return urlChanged;
+  }
+
+  public getRecentlyPlayed(roomId: string) {
+    return this.rooms.get(roomId)?.recentlyPlayed ?? [];
+  }
+
+  public async removeCoHost(roomId: string, targetUserId: string): Promise<boolean> {
+    const room = this.rooms.get(roomId);
+    if (!room || !room.coHosts.has(targetUserId)) return false;
+    room.coHosts.delete(targetUserId);
+    try {
+      await prisma.roomCoHost.deleteMany({ where: { roomId, userId: targetUserId } });
+    } catch (err) {
+      console.error("Failed to remove co-host from DB", err);
+    }
+    return true;
+  }
+
+  /** Starts a countdown that calls onDone when it ends. Returns false if one is already running. */
+  public startCountdown(roomId: string, seconds: number, onDone: () => void): number | null {
+    const room = this.rooms.get(roomId);
+    if (!room || room.countdown) return null;
+    const endsAt = Date.now() + seconds * 1000;
+    const timer = setTimeout(() => {
+      if (this.rooms.get(roomId)?.countdown?.timer === timer) {
+        room.countdown = null;
+        onDone();
+      }
+    }, seconds * 1000);
+    room.countdown = { endsAt, timer };
+    return endsAt;
+  }
+
+  public cancelCountdown(roomId: string): boolean {
+    const room = this.rooms.get(roomId);
+    if (!room?.countdown) return false;
+    clearTimeout(room.countdown.timer);
+    room.countdown = null;
+    return true;
+  }
+
+  public getCountdownEndsAt(roomId: string): number | null {
+    return this.rooms.get(roomId)?.countdown?.endsAt ?? null;
   }
 
   public getUserRoomId(userId: string): string | undefined {

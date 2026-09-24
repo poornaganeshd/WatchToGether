@@ -26,6 +26,10 @@ Watch videos in sync with friends, with video/voice chat, live chat and emoji re
 - Profiles with display name and avatar upload; password change signs out other sessions
 - Password reset by email; rate limiting on sign-in, sign-up and reset
 - TURN support: the API issues short-lived credentials (see `docker compose --profile turn`)
+- "Starting now" reminders for scheduled parties, sent to the host and their friends
+- Synced countdown start (3/5/10s) that pauses everyone and starts playback together
+- Chat moderation (delete messages, demote co-hosts), @mentions with autocomplete, highlight and a notification chime
+- Recently played list with one-click re-queue
 
 ## Getting started
 

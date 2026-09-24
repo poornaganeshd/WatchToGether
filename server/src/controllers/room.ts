@@ -160,7 +160,8 @@ export const createRoom = async (req: AuthRequest, res: Response): Promise<void>
 export const getRooms = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const rooms = await prisma.room.findMany({
-      where: { isPrivate: false, isActive: true },
+      // A room is only "live" while someone is actually in it.
+      where: { isPrivate: false, isActive: true, participants: { some: {} } },
       select: publicRoomSelect,
       orderBy: { createdAt: "desc" },
       take: 50,
@@ -249,6 +250,17 @@ export const inviteRoom = async (req: AuthRequest, res: Response): Promise<void>
 
     if (!room || !user) {
       res.status(404).json({ error: "Room or User not found" });
+      return;
+    }
+
+    // Only people who belong to the room can invite others to it; otherwise this endpoint
+    // would let anyone make the server email arbitrary addresses.
+    const isMember =
+      room.hostId === user.id ||
+      !!(await prisma.roomCoHost.findUnique({ where: { roomId_userId: { roomId, userId: user.id } } })) ||
+      !!(await prisma.roomHistoryEntry.findUnique({ where: { userId_roomId: { userId: user.id, roomId } } }));
+    if (!isMember) {
+      res.status(403).json({ error: "Join this room before inviting people to it" });
       return;
     }
 
@@ -440,7 +452,8 @@ export const updateRoom = async (req: AuthRequest, res: Response): Promise<void>
         isPrivate: nextPrivate,
         ...(nextPassword !== undefined ? { password: nextPassword } : {}),
         ...(maxParticipants !== undefined ? { maxParticipants } : {}),
-        ...(scheduledFor !== undefined ? { scheduledFor } : {}),
+        // A new start time gets a fresh "starting now" reminder.
+        ...(scheduledFor !== undefined ? { scheduledFor, reminderSentAt: null } : {}),
       },
       select: publicRoomSelect,
     });

@@ -180,6 +180,70 @@ async function run() {
     bobInRoom.emit("join_room", { roomId, userId: bob.user.id, userName: "Bob" });
     await wait(500);
     assert(!rejoinErrors.some((e) => /removed/.test(e.message)), "Unbanned user can rejoin", rejoinErrors);
+
+    console.log("\n--- Invites require room membership ---");
+    const carol = await register("Carol");
+    r = await call("POST", `/rooms/${roomId}/invite`, { email: bob.user.email }, carol.token);
+    assert(r.status === 403, "Strangers can't send invites for a room", r.status);
+    r = await call("POST", `/rooms/${roomId}/invite`, { email: bob.user.email }, alice.token);
+    assert(r.status === 200, "The host can invite", r.json);
+
+    console.log("\n--- Live list only shows rooms with people ---");
+    r = await call("POST", "/rooms", { name: "Empty Public", isPrivate: false }, alice.token);
+    const emptyId = r.json.room.id;
+    r = await call("GET", "/rooms", undefined, carol.token);
+    assert(!r.json.rooms.some((room: { id: string }) => room.id === emptyId), "Empty rooms aren't listed as live");
+    assert(r.json.rooms.some((room: { id: string }) => room.id === roomId), "Occupied public rooms are listed");
+
+    console.log("\n--- Start-time reminders ---");
+    const { runReminderSweep } = await import("../managers/ReminderScheduler");
+    const dueRoom = await prisma.room.create({
+      data: { name: "Due Now", hostId: alice.user.id, scheduledFor: new Date(Date.now() - 60_000) },
+    });
+    const staleRoom = await prisma.room.create({
+      data: { name: "Long Gone", hostId: alice.user.id, scheduledFor: new Date(Date.now() - 3 * 3600_000) },
+    });
+    const before = notes.length;
+    const notified = await runReminderSweep(io);
+    await wait(300);
+    assert(notified.includes(dueRoom.id), "Due rooms get a reminder");
+    assert(!notified.includes(staleRoom.id), "Parties that started long ago are skipped");
+    assert(notes.slice(before).some((n) => n.roomId === dueRoom.id && /starting now/.test(n.body)), "Friends are told it's starting");
+    const again = await runReminderSweep(io);
+    assert(!again.includes(dueRoom.id), "Reminders are only sent once");
+    r = await call("PATCH", `/rooms/${dueRoom.id}`, { scheduledFor: new Date(Date.now() + 3600_000).toISOString() }, alice.token);
+    const rescheduled = await prisma.room.findUnique({ where: { id: dueRoom.id } });
+    assert(r.status === 200 && rescheduled?.reminderSentAt === null, "Rescheduling re-arms the reminder");
+
+    console.log("\n--- Password change drops other sessions ---");
+    const carolPhone = await connect(carol.token);
+    const carolLaptop = await connect(carol.token);
+    const phoneDropped = new Promise((res) => carolPhone.once("disconnect", (reason) => res(reason)));
+    await wait(1100);
+    const res = await fetch(`${base}/api/auth/me/password`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${carol.token}`, "x-socket-id": carolLaptop.id! },
+      body: JSON.stringify({ currentPassword: "Secret123!", newPassword: "Changed123" }),
+    });
+    assert(res.status === 200, "Password changed");
+    assert((await Promise.race([phoneDropped, wait(2000).then(() => "timeout")])) === "io server disconnect", "Other devices are disconnected");
+    await wait(300);
+    assert(carolLaptop.connected, "The requesting device stays connected");
+    const reconnect = await new Promise<string>((resolve) => {
+      const s = Client(base, { auth: { token: carol.token }, reconnection: false, forceNew: true });
+      sockets.push(s);
+      s.on("connect", () => resolve("connected"));
+      s.on("connect_error", (e) => resolve(e.message));
+    });
+    assert(reconnect.startsWith("Authentication error"), "Old tokens can't open new connections", reconnect);
+
+    console.log("\n--- Room join attempts are throttled ---");
+    const privateRoom = await call("POST", "/rooms", { name: "Locked", isPrivate: true, password: "right" }, alice.token);
+    let status = 0;
+    for (let i = 0; i < 11; i++) {
+      status = (await call("POST", "/rooms/join", { roomId: privateRoom.json.room.id, password: `wrong${i}` }, bob.token)).status;
+    }
+    assert(status === 429, "11th join attempt for the same room is throttled", status);
   } finally {
     sockets.forEach((s) => s.disconnect());
     io.close();

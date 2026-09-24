@@ -6,6 +6,7 @@ import { z } from "zod";
 import { AuthRequest, invalidateAuthCache, signAuthToken } from "../middlewares/authMiddleware";
 import { escapeHtml } from "../utils/escapeHtml";
 import { getClientUrl, sendMail } from "../utils/mailer";
+import { disconnectUserSockets } from "../socket";
 
 const prisma = new PrismaClient();
 
@@ -220,6 +221,10 @@ export const changePassword = async (req: AuthRequest, res: Response): Promise<v
       data: { passwordHash: await bcrypt.hash(parsed.data.newPassword, 10), passwordChangedAt: new Date() },
     });
     invalidateAuthCache(user.id);
+    // Live connections authenticated with old tokens must go too, except the requesting
+    // device's own socket (it just proved the password and receives a fresh token below).
+    const ownSocketId = typeof req.headers["x-socket-id"] === "string" ? req.headers["x-socket-id"] : undefined;
+    disconnectUserSockets(req.app.get("io"), user.id, ownSocketId);
     // Other sessions are signed out; hand this one a fresh token.
     res.status(200).json({ message: "Password updated", token: signAuthToken(user.id) });
   } catch (error) {
@@ -311,6 +316,7 @@ export const resetPassword = async (req: Request, res: Response): Promise<void> 
       prisma.passwordResetToken.deleteMany({ where: { userId: record.userId, usedAt: null } }),
     ]);
     invalidateAuthCache(record.userId);
+    disconnectUserSockets(req.app.get("io"), record.userId);
 
     res.status(200).json({ message: "Password reset. You can sign in now." });
   } catch (error) {

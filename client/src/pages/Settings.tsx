@@ -4,6 +4,7 @@ import api, { getErrorMessage } from "../lib/api";
 import { resizeAvatar } from "../lib/image";
 import { useAuthStore } from "../store/useAuthStore";
 import { rememberAvatars } from "../store/useAvatarStore";
+import { useSocketStore } from "../store/useSocketStore";
 import { toast } from "../store/useToastStore";
 import Logo from "../components/ui/Logo";
 import Avatar from "../components/ui/Avatar";
@@ -76,7 +77,13 @@ export default function Settings() {
     if (newPassword !== confirmPassword) return toast.error("New passwords don't match");
     setSavingPassword(true);
     try {
-      const res = await api.post("/auth/me/password", { currentPassword, newPassword });
+      // Tell the server which live connection is ours so it isn't dropped with the others.
+      const socketId = useSocketStore.getState().socket?.id;
+      const res = await api.post(
+        "/auth/me/password",
+        { currentPassword, newPassword },
+        socketId ? { headers: { "X-Socket-Id": socketId } } : undefined
+      );
       setToken(res.data.token);
       setCurrentPassword("");
       setNewPassword("");

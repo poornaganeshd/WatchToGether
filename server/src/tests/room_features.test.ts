@@ -15,7 +15,8 @@ process.env.JWT_SECRET = JWT_SECRET;
 let testsPassed = 0;
 let testsFailed = 0;
 
-function assert(condition: boolean, testName: string, detail?: string) {
+function assert(condition: boolean, testName: string, rawDetail?: unknown) {
+  const detail = rawDetail === undefined || typeof rawDetail === "string" ? rawDetail : JSON.stringify(rawDetail);
   if (condition) {
     console.log(`  [PASS] ${testName}`);
     testsPassed++;
@@ -296,7 +297,89 @@ async function runTests() {
     await wait(300);
     assert(guest.last("error")?.message === "Nothing is queued to skip to", "Can't vote to skip with an empty queue");
 
-    console.log("\n--- Test 19: Evicting a room notifies everyone ---");
+    console.log("\n--- Test 19: Recently played ---");
+    const recent = host.last("recently_played") as { url: string }[];
+    assert(Array.isArray(recent) && recent[0]?.url === "https://example.com/next.mp4", "Video changes are recorded as recently played", recent);
+
+    console.log("\n--- Test 20: Only http(s) video URLs ---");
+    host.socket.emit("change_video", { roomId: privateRoomId, url: "javascript:alert(1)" });
+    await wait(300);
+    assert(roomManager.getRoom(privateRoomId)?.playback.url === "https://example.com/next.mp4", "javascript: URLs are rejected");
+
+    console.log("\n--- Test 21: Countdown start ---");
+    guest.socket.emit("start_countdown", { roomId: privateRoomId, seconds: 3 }); // guest is a co-host here
+    await wait(300);
+    const cd = host.last("countdown");
+    assert(typeof cd?.endsAt === "number" && cd.endsAt - Date.now() > 2000, "Co-host can start a countdown everyone sees", cd);
+    assert(host.last("pause_video") !== undefined && roomManager.getRoom(privateRoomId)?.playback.playing === false, "Countdown pauses everyone first");
+    host.socket.emit("start_countdown", { roomId: privateRoomId, seconds: 3 });
+    await wait(200);
+    assert(host.last("error")?.message === "A countdown is already running", "Only one countdown at a time");
+    await wait(3000);
+    assert(host.last("countdown") === null && guest.last("play_video") !== undefined, "Playback starts for everyone when it ends");
+    assert(roomManager.getRoom(privateRoomId)?.playback.playing === true, "Server state is playing after the countdown");
+
+    host.socket.emit("start_countdown", { roomId: privateRoomId, seconds: 5 });
+    await wait(200);
+    host.socket.emit("cancel_countdown", { roomId: privateRoomId });
+    await wait(300);
+    assert(guest.last("countdown") === null && roomManager.getCountdownEndsAt(privateRoomId) === null, "Countdowns can be cancelled");
+
+    console.log("\n--- Test 22: Deleting chat messages ---");
+    host.socket.emit("send_message", { roomId: privateRoomId, userId: hostId, userName: "Host Person", content: "delete me" });
+    await wait(400);
+    const toDelete = guest.last("receive_message");
+    // Wait out the chat limiter from the flood test before the guest posts again.
+    await wait(5000);
+    guest.socket.emit("send_message", { roomId: privateRoomId, userId: guestId, userName: "Guest Person", content: "mine" });
+    await wait(400);
+    const guestMsg = host.last("receive_message");
+    host.socket.emit("delete_message", { roomId: privateRoomId, messageId: toDelete.id });
+    guest.socket.emit("delete_message", { roomId: privateRoomId, messageId: guestMsg.id });
+    await wait(400);
+    const deletedIds = (guest.events["message_deleted"] || []).map((e: { id: string }) => e.id);
+    assert(deletedIds.includes(toDelete.id) && deletedIds.includes(guestMsg.id), "Hosts and authors can delete messages");
+    assert(!(await prisma.message.findUnique({ where: { id: toDelete.id } })), "Deleted messages are removed from the database");
+
+    console.log("\n--- Test 23: Removing a co-host ---");
+    guest.socket.emit("remove_cohost", { roomId: privateRoomId, targetUserId: guestId });
+    await wait(400);
+    assert(host.last("cohost_removed")?.userId === guestId && !roomManager.isAuthorized(privateRoomId, guestId), "Co-hosts can step down");
+    const stillCo = await prisma.roomCoHost.findUnique({ where: { roomId_userId: { roomId: privateRoomId, userId: guestId } } });
+    assert(!stillCo, "Co-host removal is saved");
+    guest.socket.emit("delete_message", { roomId: privateRoomId, messageId: "x".repeat(10) });
+    guest.socket.emit("start_countdown", { roomId: privateRoomId, seconds: 3 });
+    await wait(300);
+    assert(roomManager.getCountdownEndsAt(privateRoomId) === null, "Former co-hosts lose host controls");
+
+    console.log("\n--- Test 24: Long display names can join ---");
+    const longName = "L".repeat(90);
+    await prisma.user.update({ where: { id: outsiderId }, data: { name: longName } });
+    roomManager.getRoom(privateRoomId)!.bannedUserIds.clear();
+    roomManager.updateSettings(privateRoomId, { maxParticipants: 10 });
+    const longClient = new TestClient(outsiderId, longName, url, jwt.sign({ userId: outsiderId }, JWT_SECRET));
+    await longClient.connect();
+    await longClient.join(privateRoomId, "secret");
+    assert(!!longClient.last("room_state"), "A 90-character name can join", longClient.last("error"));
+
+    console.log("\n--- Test 25: A socket is only in one room ---");
+    await longClient.join(otherRoomId);
+    assert(!roomManager.getRoom(privateRoomId)?.participants.has(longClient.socket.id!), "Joining another room leaves the first");
+    assert(roomManager.getRoom(otherRoomId)?.participants.has(longClient.socket.id!) === true, "…and joins the second");
+    longClient.disconnect();
+
+    console.log("\n--- Test 26: Room password attempts are throttled ---");
+    const guesser = new TestClient(outsiderId, longName, url, jwt.sign({ userId: outsiderId }, JWT_SECRET));
+    await guesser.connect();
+    for (let i = 0; i < 10; i++) {
+      guesser.socket.emit("join_room", { roomId: privateRoomId, userId: outsiderId, userName: "x", password: `guess${i}` });
+    }
+    await wait(1500);
+    await guesser.join(privateRoomId, "secret");
+    assert(guesser.last("error")?.message?.startsWith("Too many password attempts"), "Even the right password is refused after 10 wrong guesses", guesser.last("error"));
+    guesser.disconnect();
+
+    console.log("\n--- Test 27: Evicting a room notifies everyone ---");
     roomManager.evictRoom(privateRoomId);
     await wait(300);
     assert(guest.last("room_ended")?.roomId === privateRoomId, "Participants receive room_ended");

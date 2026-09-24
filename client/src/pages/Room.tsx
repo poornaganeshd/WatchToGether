@@ -17,6 +17,7 @@ import Modal from "../components/ui/Modal";
 import ChatPanel from "../components/ChatPanel";
 import PasswordPrompt from "../components/PasswordPrompt";
 import { ReactionOverlay, ReactionPicker } from "../components/Reactions";
+import CountdownOverlay from "../components/CountdownOverlay";
 import { toast } from "../store/useToastStore";
 import { loadIceServers } from "../lib/ice";
 import { copyToClipboard, formatClock } from "../lib/format";
@@ -27,7 +28,7 @@ export default function Room() {
   const location = useLocation();
   const { user } = useAuthStore();
   const navigate = useNavigate();
-  const { socket, connect, joinRoom, leaveRoom, clearMessages, connectionStatus, reconnectError, roomAccessError, endedRoomId, clearEndedRoom, unreadCount, participants, exitReason, clearExitReason, roomInfo } = useSocketStore();
+  const { socket, connect, joinRoom, leaveRoom, clearMessages, connectionStatus, reconnectError, roomAccessError, endedRoomId, clearEndedRoom, unreadCount, unreadMentions, participants, exitReason, clearExitReason, roomInfo } = useSocketStore();
   const { getLocalStream, localStream, localStreamState, screenStreamState, peers, peerStatuses, screenShares, toggleAudio, toggleVideo, shareScreen, broadcastMediaStream } = useWebRTC(id || "");
   const [isInviteModalOpen, setIsInviteModalOpen] = useState(false);
   const [mainScreenSource, setMainScreenSource] = useState<'url' | string>('url');
@@ -197,7 +198,12 @@ export default function Room() {
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setPasswordPrompt({
       open: true,
-      error: roomAccessError === 'incorrect_password' ? "That password didn't work. Try again." : null,
+      error:
+        roomAccessError === 'incorrect_password'
+          ? "That password didn't work. Try again."
+          : roomAccessError === 'throttled'
+            ? "Too many wrong attempts. Wait a few minutes before trying again."
+            : null,
     });
   }, [roomAccessError]);
 
@@ -232,11 +238,17 @@ export default function Room() {
       }
     };
 
+    const handleCohostRemoved = ({ userId }: { userId: string }) => {
+      setCoHostIds((prev) => prev.filter((uid) => uid !== userId));
+      if (userId === user.id) toast.info("You're no longer a co-host.");
+    };
+    socket.on("cohost_removed", handleCohostRemoved);
     socket.on("new_cohost", handleNewCohost);
     socket.on("room_state", handleRoomState);
     socket.on("new_host", handleNewHost);
     return () => {
       socket.off("new_cohost", handleNewCohost);
+      socket.off("cohost_removed", handleCohostRemoved);
       socket.off("room_state", handleRoomState);
       socket.off("new_host", handleNewHost);
     };
@@ -647,12 +659,16 @@ export default function Room() {
                   }}
                   className="group relative grid h-11 w-11 place-items-center rounded-xl border border-white/10 bg-ink-900/80 text-slate-200 shadow-lg backdrop-blur transition-colors hover:bg-indigo-500/30 hover:text-white"
                   title="Open chat"
-                  aria-label={unreadCount > 0 ? `Open chat, ${unreadCount} unread` : "Open chat"}
+                  aria-label={unreadMentions > 0 ? `Open chat, you were mentioned` : unreadCount > 0 ? `Open chat, ${unreadCount} unread` : "Open chat"}
                 >
                   <MessageSquare size={20} className="transition-transform group-hover:-translate-x-0.5" />
                   {unreadCount > 0 && (
-                    <span className="absolute -right-1.5 -top-1.5 min-w-[20px] rounded-full bg-fuchsia-500 px-1.5 py-0.5 text-center text-[10px] font-bold leading-none text-white shadow-lg animate-scale-in">
-                      {unreadCount > 99 ? "99+" : unreadCount}
+                    <span
+                      className={`absolute -right-1.5 -top-1.5 min-w-[20px] rounded-full px-1.5 py-0.5 text-center text-[10px] font-bold leading-none shadow-lg animate-scale-in ${
+                        unreadMentions > 0 ? "bg-amber-400 text-black" : "bg-fuchsia-500 text-white"
+                      }`}
+                    >
+                      {unreadMentions > 0 ? "@" : unreadCount > 99 ? "99+" : unreadCount}
                     </span>
                   )}
                 </button>
@@ -680,6 +696,7 @@ export default function Room() {
 
           {/* Floating emoji reactions (inside the fullscreen container so they stay visible) */}
           <ReactionOverlay />
+          {id && <CountdownOverlay roomId={id} canCancel={isHost} />}
           
           {/* Floating Cameras (rendered here so they overlay the video) */}
           {id && (!isCameraSidebarOpen || isFullscreen) && (

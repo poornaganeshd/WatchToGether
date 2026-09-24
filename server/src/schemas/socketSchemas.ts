@@ -8,14 +8,14 @@ export const joinGlobalRoomSchema = z.object({
 export const joinRoomSchema = z.object({
   roomId: z.string().uuid(),
   userId: z.string().uuid(),
-  userName: z.string().min(1).max(50),
+  userName: z.string().min(1).max(100),
   password: z.string().optional(),
 });
 
 export const sendMessageSchema = z.object({
   roomId: z.string().uuid(),
   userId: z.string().uuid(),
-  userName: z.string().min(1).max(50),
+  userName: z.string().min(1).max(100),
   content: z.string().min(1).max(1000), // Max 1000 chars for chat
 });
 
@@ -32,7 +32,8 @@ export const syncTimeSchema = z.object({
 
 export const changeVideoSchema = z.object({
   roomId: z.string().uuid(),
-  url: z.string().url().or(z.literal("")),
+  // Only http(s): other schemes (javascript:, data:, file:) have no business in a player.
+  url: z.string().trim().max(2000).url().refine((u) => /^https?:\/\//i.test(u), "Only http(s) links are supported").or(z.literal("")),
 });
 
 export const syncResponseSchema = z.object({
@@ -116,6 +117,21 @@ export const playbackReportSchema = z.object({
   roomId: z.string().uuid(),
   state: z.enum(["synced", "drifting", "buffering", "error"]),
   drift: z.number().finite().min(-86400).max(86400),
+});
+
+export const countdownSchema = z.object({
+  roomId: z.string().uuid(),
+  seconds: z.number().int().min(3).max(10),
+});
+
+export const deleteMessageSchema = z.object({
+  roomId: z.string().uuid(),
+  messageId: z.string().min(1).max(100),
+});
+
+export const targetUserSchema = z.object({
+  roomId: z.string().uuid(),
+  targetUserId: z.string().uuid(),
 });
 
 export const validateSocketPayload = <T>(schema: z.ZodType<T>, data: unknown, socket: Socket): T | null => {

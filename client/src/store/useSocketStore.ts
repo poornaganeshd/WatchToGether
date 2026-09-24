@@ -39,6 +39,42 @@ export interface SkipVotes {
 
 export type SyncState = 'synced' | 'drifting' | 'buffering' | 'error';
 
+export interface RecentlyPlayed {
+  url: string;
+  playedAt: number;
+}
+
+const escapeRegExp = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+/** True when a message @-mentions the given name (full name or first name). */
+export const mentionsUser = (content: string, name: string) => {
+  const first = name.trim().split(/\s+/)[0];
+  const candidates = Array.from(new Set([name.trim(), first].filter(Boolean)));
+  return candidates.some((n) => new RegExp(`(^|[^\\w@])@${escapeRegExp(n)}(?![\\w])`, 'i').test(content));
+};
+
+// Short two-tone chime for mentions, generated so no audio asset is needed.
+const playMentionChime = () => {
+  try {
+    const Ctx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+    const ctx = new Ctx();
+    [880, 1320].forEach((freq, i) => {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.frequency.value = freq;
+      gain.gain.setValueAtTime(0.0001, ctx.currentTime + i * 0.12);
+      gain.gain.exponentialRampToValueAtTime(0.08, ctx.currentTime + i * 0.12 + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + i * 0.12 + 0.25);
+      osc.connect(gain).connect(ctx.destination);
+      osc.start(ctx.currentTime + i * 0.12);
+      osc.stop(ctx.currentTime + i * 0.12 + 0.3);
+    });
+    setTimeout(() => ctx.close(), 800);
+  } catch {
+    /* audio unavailable */
+  }
+};
+
 export interface Reaction {
   key: string;
   emoji: string;
@@ -58,7 +94,7 @@ export interface RoomInfoUpdate {
   maxParticipants: number;
 }
 
-export type RoomAccessError = 'password_required' | 'incorrect_password' | null;
+export type RoomAccessError = 'password_required' | 'incorrect_password' | 'throttled' | null;
 
 const MAX_MESSAGES = 300;
 
@@ -80,6 +116,10 @@ interface SocketState {
   subtitles: Subtitles | null;
   skipVotes: SkipVotes;
   viewerSync: Record<string, { state: SyncState; drift: number }>;
+  recentlyPlayed: RecentlyPlayed[];
+  /** Local clock time the countdown ends, or null. */
+  countdownEndsAt: number | null;
+  unreadMentions: number;
   currentRoomSession: RoomSession | null;
   connect: () => void;
   disconnect: () => void;
@@ -128,6 +168,9 @@ export const useSocketStore = create<SocketState>((set, get) => ({
   subtitles: null,
   skipVotes: { count: 0, needed: 1, voters: [] },
   viewerSync: {},
+  recentlyPlayed: [],
+  countdownEndsAt: null,
+  unreadMentions: 0,
   currentRoomSession: null,
 
   connect: () => {
@@ -157,15 +200,38 @@ export const useSocketStore = create<SocketState>((set, get) => ({
       socket.on('disconnect', (reason) => {
         console.warn("Socket disconnected:", reason);
         set({ connectionStatus: 'reconnecting', participants: {} });
+        // The server drops every session after a password change. Socket.IO won't retry a
+        // server-initiated disconnect, so reconnect ourselves: this device holds the new
+        // token, other devices fail authentication below and are signed out.
+        if (reason === 'io server disconnect' && useAuthStore.getState().token) {
+          socket.connect();
+        }
       });
 
       socket.on('connect_error', (err) => {
         console.error("Socket Connect Error:", err);
+        if (err.message?.startsWith('Authentication error') && useAuthStore.getState().token) {
+          // Token expired or revoked (e.g. password changed elsewhere): stop retrying and sign out.
+          socket.disconnect();
+          set({ socket: null, connectionStatus: 'disconnected', currentRoomSession: null });
+          useAuthStore.getState().logout();
+          toast.info("Your session ended. Please sign in again.");
+          return;
+        }
         set({ connectionStatus: 'reconnecting', reconnectError: err.message || "Failed to connect to server" });
       });
 
       socket.on('receive_message', (message: Message) => {
+        const me = useAuthStore.getState().user;
+        const isMention = !!me && message.userId !== me.id && mentionsUser(message.content, me.name);
+        if (isMention) {
+          playMentionChime();
+          if (document.hidden && 'Notification' in window && Notification.permission === 'granted') {
+            new Notification(`${message.userName} mentioned you`, { body: message.content.slice(0, 140), icon: '/favicon.svg' });
+          }
+        }
         set((state) => ({
+          unreadMentions: isMention && !state.isChatVisible ? state.unreadMentions + 1 : state.unreadMentions,
           messages: appendMessage(state.messages, message),
           typingUsers: Object.fromEntries(
             Object.entries(state.typingUsers).filter(([, name]) => name !== message.userName)
@@ -194,6 +260,19 @@ export const useSocketStore = create<SocketState>((set, get) => ({
       socket.on('user_joined', ({ socketId, userId, userName, avatarVersion }: Participant) => {
         rememberAvatars({ [userId]: avatarVersion });
         set((state) => ({ participants: { ...state.participants, [socketId]: { socketId, userId, userName, avatarVersion } } }));
+      });
+
+      socket.on('message_deleted', ({ id }: { id: string }) => {
+        set((state) => ({ messages: state.messages.filter((m) => m.id !== id) }));
+      });
+
+      socket.on('recently_played', (recentlyPlayed: RecentlyPlayed[]) => {
+        set({ recentlyPlayed });
+      });
+
+      socket.on('countdown', (data: { endsAt: number; serverTime: number } | null) => {
+        // Convert the server's clock to ours so the overlay ends on time despite clock skew.
+        set({ countdownEndsAt: data ? Date.now() + (data.endsAt - data.serverTime) : null });
       });
 
       socket.on('subtitles_updated', (subtitles: Subtitles | null) => {
@@ -287,9 +366,12 @@ export const useSocketStore = create<SocketState>((set, get) => ({
           errorMsg.includes("queue is full") ||
           errorMsg.includes("too quickly") ||
           errorMsg.includes("Nothing is queued") ||
-          errorMsg.includes("Subtitle file")
+          errorMsg.includes("Subtitle file") ||
+          errorMsg.includes("countdown")
         ) {
           toast.error(errorMsg);
+        } else if (errorMsg.includes("Too many password attempts")) {
+          set({ roomAccessError: 'throttled' });
         } else if (errorMsg.includes("Incorrect password")) {
           set({ roomAccessError: 'incorrect_password' });
         } else if (errorMsg.includes("Password required")) {
@@ -330,7 +412,7 @@ export const useSocketStore = create<SocketState>((set, get) => ({
   },
 
   leaveRoom: (roomId, userId, userName) => {
-    set({ currentRoomSession: null, reconnectError: null, roomAccessError: null, participants: {}, reactions: [], queue: [], typingUsers: {}, roomInfo: null, subtitles: null, skipVotes: { count: 0, needed: 1, voters: [] }, viewerSync: {} });
+    set({ currentRoomSession: null, reconnectError: null, roomAccessError: null, participants: {}, reactions: [], queue: [], typingUsers: {}, roomInfo: null, subtitles: null, skipVotes: { count: 0, needed: 1, voters: [] }, viewerSync: {}, recentlyPlayed: [], countdownEndsAt: null, unreadMentions: 0 });
     const { socket } = get();
     if (socket) {
       socket.emit('leave_room', { roomId, userId, userName });
@@ -354,9 +436,9 @@ export const useSocketStore = create<SocketState>((set, get) => ({
 
   addMessage: (message) => set((state) => ({ messages: appendMessage(state.messages, message) })),
 
-  clearMessages: () => set({ messages: [], unreadCount: 0 }),
+  clearMessages: () => set({ messages: [], unreadCount: 0, unreadMentions: 0 }),
 
-  setChatVisible: (visible) => set(visible ? { isChatVisible: true, unreadCount: 0 } : { isChatVisible: false }),
+  setChatVisible: (visible) => set(visible ? { isChatVisible: true, unreadCount: 0, unreadMentions: 0 } : { isChatVisible: false }),
 
   clearEndedRoom: () => set({ endedRoomId: null }),
 

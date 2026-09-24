@@ -1,6 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
-import { ArrowDown, ChevronDown, ChevronRight, ChevronUp, Clock, Crown, ListVideo, MessageSquare, Mic2, Play, Plus, SendHorizonal, Settings, Share2, Shield, SkipForward, Users, UserX, X } from "lucide-react";
-import { useSocketStore, type Message, type QueueItem } from "../store/useSocketStore";
+import { ArrowDown, ChevronDown, ChevronRight, ChevronUp, Clock, Crown, History, ListPlus, ListVideo, MessageSquare, Mic2, Play, Plus, SendHorizonal, Settings, Share2, Shield, ShieldOff, SkipForward, Trash2, Users, UserX, X } from "lucide-react";
+import { mentionsUser, useSocketStore, type Message, type QueueItem } from "../store/useSocketStore";
+import { timeAgo } from "../lib/format";
 import Avatar from "./ui/Avatar";
 
 const TIMESTAMP_REGEX = /\[Time:\s*(\d{1,2}:\d{2}(?::\d{2})?)\]/g;
@@ -24,6 +25,8 @@ interface ChatPanelProps {
 }
 
 const TYPING_IDLE_MS = 3000;
+const MENTION_TOKEN = /(@[\p{L}\p{N}_.-]+)/u;
+const TRAILING_MENTION = /(^|\s)@([^\s@]*)$/;
 
 const describeUrl = (url: string) => {
   try {
@@ -53,6 +56,8 @@ export default function ChatPanel({
   const queue = useSocketStore((s) => s.queue);
   const skipVotes = useSocketStore((s) => s.skipVotes);
   const viewerSync = useSocketStore((s) => s.viewerSync);
+  const recentlyPlayed = useSocketStore((s) => s.recentlyPlayed);
+  const [mentionIndex, setMentionIndex] = useState(0);
   const socket = useSocketStore((s) => s.socket);
   const [tab, setTab] = useState<"chat" | "queue" | "people">("chat");
   const [queueUrl, setQueueUrl] = useState("");
@@ -144,9 +149,30 @@ export default function ChatPanel({
     inputRef.current?.focus();
   };
 
+  const renderMentions = (text: string, key: number) => {
+    const pieces = text.split(MENTION_TOKEN);
+    if (pieces.length === 1) return <span key={key}>{text}</span>;
+    return (
+      <span key={key}>
+        {pieces.map((piece, j) =>
+          j % 2 === 1 ? (
+            <span
+              key={j}
+              className={`rounded px-0.5 font-semibold ${mentionsUser(piece, currentUser.name) ? "bg-amber-400/25 text-amber-200" : "text-indigo-200"}`}
+            >
+              {piece}
+            </span>
+          ) : (
+            piece
+          )
+        )}
+      </span>
+    );
+  };
+
   const renderContent = (content: string) => {
     const parts = content.split(TIMESTAMP_REGEX);
-    if (parts.length === 1) return content;
+    if (parts.length === 1) return renderMentions(content, 0);
     return parts.map((part, i) =>
       i % 2 === 1 ? (
         <button
@@ -159,7 +185,7 @@ export default function ChatPanel({
           <Clock size={11} /> {part}
         </button>
       ) : (
-        <span key={i}>{part}</span>
+        renderMentions(part, i)
       )
     );
   };
@@ -171,6 +197,39 @@ export default function ChatPanel({
       const rank = (uid: string) => (uid === hostId ? 0 : coHostIds.includes(uid) ? 1 : 2);
       return rank(a.userId) - rank(b.userId) || a.userName.localeCompare(b.userName);
     });
+
+  // @-mention autocomplete for the word being typed at the end of the input.
+  const mentionMatch = input.match(TRAILING_MENTION);
+  const mentionQuery = mentionMatch ? mentionMatch[2].toLowerCase() : null;
+  const mentionSuggestions =
+    mentionQuery === null
+      ? []
+      : people
+          .filter((p) => p.userId !== currentUser.id && p.userName.toLowerCase().includes(mentionQuery))
+          .slice(0, 5);
+  const activeMention = Math.min(mentionIndex, Math.max(0, mentionSuggestions.length - 1));
+
+  const insertMention = (name: string) => {
+    setInput((prev) => prev.replace(TRAILING_MENTION, (_m, lead) => `${lead}@${name} `));
+    setMentionIndex(0);
+    inputRef.current?.focus();
+  };
+
+  const handleInputKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (mentionSuggestions.length === 0) return;
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      e.preventDefault();
+      const delta = e.key === "ArrowDown" ? 1 : -1;
+      setMentionIndex((activeMention + delta + mentionSuggestions.length) % mentionSuggestions.length);
+    } else if (e.key === "Enter" || e.key === "Tab") {
+      e.preventDefault();
+      insertMention(mentionSuggestions[activeMention].userName);
+    } else if (e.key === "Escape") {
+      setInput((prev) => `${prev} `);
+    }
+  };
+
+  const canModerate = isHost;
 
   return (
     <aside className="fixed inset-y-0 right-0 z-[9999] flex h-full w-full flex-col border-l border-white/5 bg-ink-900/95 shadow-2xl backdrop-blur-xl animate-slide-in-right md:relative md:z-20 md:w-80 lg:w-96">
@@ -238,6 +297,12 @@ export default function ChatPanel({
                     prev={messages[idx - 1]}
                     isMe={msg.userId === currentUser.id}
                     isHostUser={msg.userId === hostId}
+                    mentionsMe={msg.userId !== currentUser.id && mentionsUser(msg.content, currentUser.name)}
+                    onDelete={
+                      msg.userId === currentUser.id || canModerate
+                        ? () => socket?.emit("delete_message", { roomId, messageId: msg.id })
+                        : undefined
+                    }
                     render={renderContent}
                   />
                 ))
@@ -269,14 +334,37 @@ export default function ChatPanel({
             </div>
           )}
 
-          <form onSubmit={handleSend} className="flex items-center gap-2 border-t border-white/5 p-3">
+          <form onSubmit={handleSend} className="relative flex items-center gap-2 border-t border-white/5 p-3">
+            {mentionSuggestions.length > 0 && (
+              <div className="absolute bottom-full left-3 right-3 mb-1 overflow-hidden rounded-xl border border-white/10 bg-ink-850/95 shadow-2xl backdrop-blur-xl animate-fade-up" role="listbox" aria-label="Mention someone">
+                {mentionSuggestions.map((p, i) => (
+                  <button
+                    key={p.socketId}
+                    type="button"
+                    role="option"
+                    aria-selected={i === activeMention}
+                    onMouseDown={(e) => {
+                      e.preventDefault();
+                      insertMention(p.userName);
+                    }}
+                    className={`flex w-full items-center gap-2 px-3 py-2 text-left text-sm ${i === activeMention ? "bg-white/10 text-white" : "text-slate-300 hover:bg-white/5"}`}
+                  >
+                    <Avatar name={p.userName} seed={p.userId} size={22} /> {p.userName}
+                  </button>
+                ))}
+              </div>
+            )}
             <div className="flex flex-1 items-center rounded-xl border border-white/10 bg-ink-950/80 pr-1 focus-within:border-indigo-400/50 focus-within:ring-2 focus-within:ring-indigo-500/20">
               <input
                 ref={inputRef}
                 type="text"
                 value={input}
                 maxLength={1000}
-                onChange={(e) => handleInputChange(e.target.value)}
+                onChange={(e) => {
+                  handleInputChange(e.target.value);
+                  setMentionIndex(0);
+                }}
+                onKeyDown={handleInputKeyDown}
                 onBlur={stopTyping}
                 placeholder="Send a message"
                 className="min-w-0 flex-1 bg-transparent px-3 py-2.5 text-sm text-slate-100 placeholder:text-slate-500 focus:outline-none"
@@ -376,6 +464,36 @@ export default function ChatPanel({
                 );
               })
             )}
+            {recentlyPlayed.length > 0 && (
+              <div className="pt-4">
+                <h4 className="mb-2 flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wide text-slate-500">
+                  <History size={12} /> Recently played
+                </h4>
+                <div className="space-y-1">
+                  {recentlyPlayed.map((item) => {
+                    const info = describeUrl(item.url);
+                    const alreadyQueued = queue.some((q) => q.url === item.url);
+                    return (
+                      <div key={item.url} className="flex items-center gap-2 rounded-lg px-2 py-1.5 hover:bg-white/[0.03]">
+                        <div className="min-w-0 flex-1">
+                          <p className="truncate text-xs text-slate-300" title={item.url}>{info.title}</p>
+                          <p className="text-[10px] text-slate-600">{timeAgo(new Date(item.playedAt))}</p>
+                        </div>
+                        <button
+                          onClick={() => socket?.emit("queue_add", { roomId, url: item.url })}
+                          disabled={alreadyQueued}
+                          className="btn-ghost p-1.5 text-slate-400 disabled:opacity-30"
+                          title={alreadyQueued ? "Already in the queue" : "Add to queue again"}
+                          aria-label="Add to queue again"
+                        >
+                          <ListPlus size={14} />
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
           </div>
         </div>
       ) : (
@@ -401,6 +519,16 @@ export default function ChatPanel({
                 ) : isCo ? (
                   <Shield size={15} className="text-indigo-300" aria-label="Co-host" />
                 ) : null}
+                {isCo && (hostId === currentUser.id || p.userId === currentUser.id) && (
+                  <button
+                    onClick={() => socket?.emit("remove_cohost", { roomId, targetUserId: p.userId })}
+                    className="btn-ghost p-1.5 opacity-60 transition-opacity hover:text-amber-300 group-hover:opacity-100"
+                    title={p.userId === currentUser.id ? "Step down as co-host" : "Remove co-host"}
+                    aria-label={p.userId === currentUser.id ? "Step down as co-host" : `Remove ${p.userName} as co-host`}
+                  >
+                    <ShieldOff size={14} />
+                  </button>
+                )}
                 {isHost && !isRoomHost && p.userId !== currentUser.id && (
                   <div className="flex items-center opacity-60 transition-opacity group-hover:opacity-100">
                     {hostId === currentUser.id && !isCo && (
@@ -426,18 +554,20 @@ export default function ChatPanel({
 }
 
 function ChatMessage({
-  msg, prev, isMe, isHostUser, render,
+  msg, prev, isMe, isHostUser, mentionsMe, onDelete, render,
 }: {
   msg: Message;
   prev?: Message;
   isMe: boolean;
   isHostUser: boolean;
+  mentionsMe: boolean;
+  onDelete?: () => void;
   render: (content: string) => React.ReactNode;
 }) {
   const grouped = !!prev && prev.userId === msg.userId && new Date(msg.createdAt).getTime() - new Date(prev.createdAt).getTime() < GROUP_WINDOW_MS;
 
   return (
-    <div className={`flex gap-2 ${isMe ? "flex-row-reverse" : ""} ${grouped ? "mt-0.5" : "mt-3 first:mt-0"}`}>
+    <div className={`group/msg flex gap-2 ${isMe ? "flex-row-reverse" : ""} ${grouped ? "mt-0.5" : "mt-3 first:mt-0"}`}>
       <div className="w-7 shrink-0">{!grouped && !isMe && <Avatar name={msg.userName} seed={msg.userId} size={28} />}</div>
       <div className={`flex max-w-[80%] flex-col ${isMe ? "items-end" : "items-start"}`}>
         {!grouped && (
@@ -447,13 +577,29 @@ function ChatMessage({
             <span className="text-slate-600">{formatTime(msg.createdAt)}</span>
           </div>
         )}
-        <div
-          className={`whitespace-pre-wrap break-words rounded-2xl px-3 py-2 text-sm leading-relaxed ${
-            isMe ? "rounded-tr-md bg-gradient-to-br from-indigo-500 to-violet-500 text-white" : "rounded-tl-md bg-white/[0.06] text-slate-200"
-          }`}
-          title={formatTime(msg.createdAt)}
-        >
-          {render(msg.content)}
+        <div className={`flex items-center gap-1 ${isMe ? "flex-row-reverse" : ""}`}>
+          <div
+            className={`whitespace-pre-wrap break-words rounded-2xl px-3 py-2 text-sm leading-relaxed ${
+              isMe
+                ? "rounded-tr-md bg-gradient-to-br from-indigo-500 to-violet-500 text-white"
+                : mentionsMe
+                  ? "rounded-tl-md bg-amber-400/10 text-slate-100 ring-1 ring-amber-400/40"
+                  : "rounded-tl-md bg-white/[0.06] text-slate-200"
+            }`}
+            title={formatTime(msg.createdAt)}
+          >
+            {render(msg.content)}
+          </div>
+          {onDelete && (
+            <button
+              onClick={onDelete}
+              className="shrink-0 rounded-md p-1 text-slate-500 opacity-0 transition-opacity hover:bg-white/5 hover:text-red-300 focus:opacity-100 group-hover/msg:opacity-100"
+              title="Delete message"
+              aria-label="Delete message"
+            >
+              <Trash2 size={13} />
+            </button>
+          )}
         </div>
       </div>
     </div>

@@ -38,6 +38,45 @@ const voteLimiter = createLimiter(10, 10000);
 
 const MAX_SUBTITLE_CHARS = 350_000;
 
+// Counts only failed room-password attempts, so correct passwords are never throttled.
+const failedJoins = (() => {
+  const WINDOW_MS = 15 * 60 * 1000;
+  const MAX_FAILURES = 10;
+  const failures = new Map<string, { count: number; resetAt: number }>();
+  setInterval(() => {
+    const now = Date.now();
+    for (const [key, entry] of failures) if (entry.resetAt <= now) failures.delete(key);
+  }, 60_000).unref();
+  return {
+    isBlocked(key: string) {
+      const entry = failures.get(key);
+      if (!entry) return false;
+      if (entry.resetAt <= Date.now()) {
+        failures.delete(key);
+        return false;
+      }
+      return entry.count >= MAX_FAILURES;
+    },
+    recordFailure(key: string) {
+      const now = Date.now();
+      const entry = failures.get(key);
+      if (!entry || entry.resetAt <= now) failures.set(key, { count: 1, resetAt: now + WINDOW_MS });
+      else entry.count++;
+    },
+    clear(key: string) {
+      failures.delete(key);
+    },
+  };
+})();
+
+/** Disconnects every socket belonging to a user (e.g. after their password changed). */
+export const disconnectUserSockets = (io: Server | undefined, userId: string, keepSocketId?: string) => {
+  if (!io) return;
+  for (const s of io.sockets.sockets.values()) {
+    if (s.data.userId === userId && s.id !== keepSocketId) s.disconnect(true);
+  }
+};
+
 /** Tells a user's accepted friends to refresh their presence view. */
 const notifyFriendsOfPresence = async (io: Server, userId: string) => {
   try {
@@ -88,6 +127,9 @@ export const setupSocketHandlers = (io: Server, gracePeriodOrManager?: number | 
       const room = roomManager.getRoom(roomId);
       io.to(roomId).emit("subtitles_updated", room?.subtitles ?? null);
       io.to(roomId).emit("skip_votes", roomManager.getSkipState(roomId));
+      io.to(roomId).emit("recently_played", roomManager.getRecentlyPlayed(roomId));
+      // A new video makes any pending countdown meaningless.
+      if (roomManager.cancelCountdown(roomId)) io.to(roomId).emit("countdown", null);
     };
 
     socket.on("join_global_room", (data) => {
@@ -136,10 +178,17 @@ export const setupSocketHandlers = (io: Server, gracePeriodOrManager?: number | 
               socket.emit("error", { message: "Password required for private room" });
               return;
             }
+            const attemptKey = `${userId}|${roomId}`;
+            if (failedJoins.isBlocked(attemptKey)) {
+              socket.emit("error", { message: "Too many password attempts. Try again in a few minutes." });
+              return;
+            }
             if (!(await verifyRoomPassword(roomAuth.password, password))) {
+              failedJoins.recordFailure(attemptKey);
               socket.emit("error", { message: "Incorrect password" });
               return;
             }
+            failedJoins.clear(attemptKey);
           }
         }
 
@@ -159,6 +208,13 @@ export const setupSocketHandlers = (io: Server, gracePeriodOrManager?: number | 
         const avatarVersion = dbUser?.avatarUpdatedAt?.getTime() ?? null;
         const displayName = dbUser?.name || userName;
 
+        // A socket belongs to one room at a time; leave any other room it is still in.
+        const previousRoomId = roomManager.getSocketRoomId(socket.id);
+        if (previousRoomId && previousRoomId !== roomId) {
+          socket.leave(previousRoomId);
+          await roomManager.handleLeave(previousRoomId, socket.id, userId);
+        }
+
         const success = await roomManager.handleJoin(roomId, socket.id, userId, displayName, avatarVersion);
         if (!success) {
           socket.emit("error", { message: "Room not found" });
@@ -177,6 +233,9 @@ export const setupSocketHandlers = (io: Server, gracePeriodOrManager?: number | 
           socket.emit("queue_updated", room.queue);
           socket.emit("subtitles_updated", room.subtitles);
           socket.emit("viewer_sync_all", roomManager.getSyncReports(roomId));
+          socket.emit("recently_played", room.recentlyPlayed);
+          const countdownEndsAt = roomManager.getCountdownEndsAt(roomId);
+          if (countdownEndsAt) socket.emit("countdown", { endsAt: countdownEndsAt, serverTime: Date.now() });
           socket.emit("room_participant_statuses", roomManager.getParticipantStatuses(roomId));
           socket.emit("room_participants", roomManager.getParticipants(roomId));
         }
@@ -340,6 +399,78 @@ export const setupSocketHandlers = (io: Server, gracePeriodOrManager?: number | 
       const changed = roomManager.updatePlayback(senderRoomId, { url: payload.url, time: 0 });
       socket.to(senderRoomId).emit("change_video", { url: payload.url });
       if (changed) emitVideoScopedState(senderRoomId);
+    });
+
+    // --- COUNTDOWN START ---
+    // Pauses everyone at the current position, counts down, then starts playback for all at once.
+    socket.on("start_countdown", (data) => {
+      const p = schemas.validateSocketPayload(schemas.countdownSchema, data, socket);
+      if (!p) return;
+      const senderRoomId = roomManager.getSocketRoomId(socket.id);
+      if (senderRoomId !== p.roomId || !roomManager.isAuthorized(senderRoomId, userId)) return;
+      const room = roomManager.getRoom(senderRoomId);
+      if (!room || !room.playback.url) {
+        socket.emit("error", { message: "Pick a video before starting a countdown" });
+        return;
+      }
+
+      const startAt = roomManager.getCurrentPlaybackTime(room.playback);
+      const endsAt = roomManager.startCountdown(senderRoomId, p.seconds, () => {
+        roomManager.updatePlayback(senderRoomId, { playing: true, time: startAt });
+        io.to(senderRoomId).emit("countdown", null);
+        io.to(senderRoomId).emit("play_video", { time: startAt, serverTime: Date.now() });
+      });
+      if (!endsAt) {
+        socket.emit("error", { message: "A countdown is already running" });
+        return;
+      }
+      roomManager.updatePlayback(senderRoomId, { playing: false, time: startAt });
+      io.to(senderRoomId).emit("pause_video", { time: startAt, serverTime: Date.now() });
+      io.to(senderRoomId).emit("countdown", { endsAt, serverTime: Date.now() });
+    });
+
+    socket.on("cancel_countdown", (data) => {
+      const p = schemas.validateSocketPayload(schemas.roomOnlySchema, data, socket);
+      if (!p) return;
+      const senderRoomId = roomManager.getSocketRoomId(socket.id);
+      if (senderRoomId !== p.roomId || !roomManager.isAuthorized(senderRoomId, userId)) return;
+      if (roomManager.cancelCountdown(senderRoomId)) io.to(senderRoomId).emit("countdown", null);
+    });
+
+    // --- MODERATION ---
+    socket.on("delete_message", async (data) => {
+      const p = schemas.validateSocketPayload(schemas.deleteMessageSchema, data, socket);
+      if (!p) return;
+      const senderRoomId = roomManager.getSocketRoomId(socket.id);
+      if (senderRoomId !== p.roomId) return;
+      try {
+        const message = await prisma.message.findUnique({ where: { id: p.messageId }, select: { roomId: true, userId: true } });
+        if (!message || message.roomId !== senderRoomId) return;
+        // Authors can delete their own messages; hosts and co-hosts can delete anyone's.
+        if (message.userId !== userId && !roomManager.isAuthorized(senderRoomId, userId)) return;
+        await prisma.message.delete({ where: { id: p.messageId } });
+        io.to(senderRoomId).emit("message_deleted", { id: p.messageId });
+      } catch (err) {
+        console.error("Failed to delete message:", err);
+      }
+    });
+
+    socket.on("remove_cohost", async (data) => {
+      const p = schemas.validateSocketPayload(schemas.targetUserSchema, data, socket);
+      if (!p) return;
+      const senderRoomId = roomManager.getSocketRoomId(socket.id);
+      if (senderRoomId !== p.roomId) return;
+      const room = roomManager.getRoom(senderRoomId);
+      if (!room) return;
+      // Co-hosts may step down themselves; only the host can demote someone else.
+      if (room.hostId !== userId && p.targetUserId !== userId) {
+        socket.emit("error", { message: "Only the host can remove a co-host" });
+        return;
+      }
+      if (await roomManager.removeCoHost(senderRoomId, p.targetUserId)) {
+        io.to(senderRoomId).emit("cohost_removed", { userId: p.targetUserId });
+        io.to(senderRoomId).emit("room_state", { hostId: room.hostId, coHosts: Array.from(room.coHosts), startedAt: room.startedAt });
+      }
     });
 
     // --- VOTE TO SKIP ---

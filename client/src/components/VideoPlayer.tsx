@@ -2,7 +2,7 @@ import { useState, useRef, useEffect, forwardRef, useImperativeHandle, useCallba
 import ReactPlayer from "react-player";
 import { useSocketStore } from "../store/useSocketStore";
 import { useAudioStore } from "../store/useAudioStore";
-import { Captions, CaptionsOff, FileText, FileVideo, Link2, MonitorPlay, MonitorUp, RefreshCcw, Square, X } from "lucide-react";
+import { Captions, CaptionsOff, FileText, Timer, TimerOff, FileVideo, Link2, MonitorPlay, MonitorUp, RefreshCcw, Square, X } from "lucide-react";
 import SubtitleOverlay from "./SubtitleOverlay";
 import { toWebVtt } from "../lib/subtitles";
 import { toast } from "../store/useToastStore";
@@ -26,6 +26,7 @@ interface VideoPlayerProps {
 const VideoPlayer = forwardRef<VideoPlayerRef, VideoPlayerProps>(({ roomId, isFullscreen = false, isHost, isRoomHost = false, broadcastMediaStream, shareScreen }, ref) => {
   const { socket } = useSocketStore();
   const subtitles = useSocketStore((s) => s.subtitles);
+  const countdownEndsAt = useSocketStore((s) => s.countdownEndsAt);
   const [showSubtitles, setShowSubtitles] = useState(() => localStorage.getItem("wt_pref_subtitles") !== "false");
   const bufferingRef = useRef(false);
   const [url, setUrl] = useState("https://www.youtube.com/watch?v=aqz-KE-bpKQ");
@@ -642,6 +643,27 @@ const VideoPlayer = forwardRef<VideoPlayerRef, VideoPlayerProps>(({ roomId, isFu
                 </>
               )}
             </div>
+            {url && (
+              <div className="flex items-center gap-2">
+                {countdownEndsAt ? (
+                  <button type="button" onClick={() => socket?.emit("cancel_countdown", { roomId })} className="btn-secondary flex-1 px-3 py-2 text-xs">
+                    <TimerOff size={14} /> Cancel countdown
+                  </button>
+                ) : (
+                  [3, 5, 10].map((secs) => (
+                    <button
+                      key={secs}
+                      type="button"
+                      onClick={() => socket?.emit("start_countdown", { roomId, seconds: secs })}
+                      className="btn-secondary flex-1 px-2 py-2 text-xs"
+                      title={`Pause everyone, count down ${secs} seconds, then play`}
+                    >
+                      <Timer size={14} /> {secs}s start
+                    </button>
+                  ))
+                )}
+              </div>
+            )}
             <div className="flex items-center gap-2 border-t border-white/5 pt-2.5">
               {shareScreen && (
                 <button onClick={shareScreen} className="btn-secondary flex-1 px-3 py-2 text-xs">
