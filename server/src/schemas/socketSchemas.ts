@@ -75,6 +75,49 @@ export const screenShareStartSchema = z.object({
   streamId: z.string(),
 });
 
+export const ALLOWED_REACTIONS = ["😂", "❤️", "🔥", "👏", "😮", "😢", "🍿", "👍"] as const;
+
+export const reactionSchema = z.object({
+  roomId: z.string().uuid(),
+  emoji: z.enum(ALLOWED_REACTIONS),
+});
+
+export const targetSocketSchema = z.object({
+  roomId: z.string().uuid(),
+  targetSocketId: z.string().min(1).max(100),
+});
+
+export const typingSchema = z.object({
+  roomId: z.string().uuid(),
+  isTyping: z.boolean(),
+});
+
+export const queueAddSchema = z.object({
+  roomId: z.string().uuid(),
+  url: z.string().trim().url().max(2000).refine((u) => /^https?:\/\//i.test(u), "Only http(s) links are supported"),
+});
+
+export const queueItemSchema = z.object({
+  roomId: z.string().uuid(),
+  itemId: z.string().min(1).max(100),
+});
+
+export const queueMoveSchema = queueItemSchema.extend({
+  direction: z.enum(["up", "down"]),
+});
+
+export const subtitlesSchema = z.object({
+  roomId: z.string().uuid(),
+  label: z.string().trim().min(1).max(100),
+  vtt: z.string().startsWith("WEBVTT"),
+});
+
+export const playbackReportSchema = z.object({
+  roomId: z.string().uuid(),
+  state: z.enum(["synced", "drifting", "buffering", "error"]),
+  drift: z.number().finite().min(-86400).max(86400),
+});
+
 export const validateSocketPayload = <T>(schema: z.ZodType<T>, data: unknown, socket: Socket): T | null => {
   const result = schema.safeParse(data);
   if (!result.success) {

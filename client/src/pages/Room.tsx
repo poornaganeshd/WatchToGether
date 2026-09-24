@@ -1,4 +1,4 @@
-import { useEffect, useState, useRef } from "react";
+import { useEffect, useState, useRef, useCallback } from "react";
 import { useParams, useNavigate, useLocation } from "react-router-dom";
 import { useAuthStore } from "../store/useAuthStore";
 import { useSocketStore } from "../store/useSocketStore";
@@ -8,10 +8,18 @@ import RemoteAudioManager from "../components/RemoteAudioManager";
 import { useWebRTC } from "../hooks/useWebRTC";
 import { useVoiceActivityDetection } from "../hooks/useVoiceActivityDetection";
 import { useAudioStore } from "../store/useAudioStore";
-import { Settings, Mic2, MessageSquare, Users, ChevronRight, Share2, Clock } from "lucide-react";
-import api from "../lib/api";
+import { Mic2, MessageSquare, Users, ChevronRight, Share2, LogOut, Copy, Check, WifiOff, SlidersHorizontal } from "lucide-react";
+import api, { getErrorMessage } from "../lib/api";
 import AudioSettingsModal from "../components/AudioSettingsModal";
 import InviteModal from "../components/InviteModal";
+import RoomSettingsModal from "../components/RoomSettingsModal";
+import Modal from "../components/ui/Modal";
+import ChatPanel from "../components/ChatPanel";
+import PasswordPrompt from "../components/PasswordPrompt";
+import { ReactionOverlay, ReactionPicker } from "../components/Reactions";
+import { toast } from "../store/useToastStore";
+import { loadIceServers } from "../lib/ice";
+import { copyToClipboard, formatClock } from "../lib/format";
 import type { VideoPlayerRef } from "../components/VideoPlayer";
 
 export default function Room() {
@@ -19,18 +27,26 @@ export default function Room() {
   const location = useLocation();
   const { user } = useAuthStore();
   const navigate = useNavigate();
-  const { socket, connect, joinRoom, leaveRoom, sendMessage, messages, clearMessages, connectionStatus, reconnectError } = useSocketStore();
-  const [chatInput, setChatInput] = useState("");
-  const chatRef = useRef<HTMLDivElement>(null);
+  const { socket, connect, joinRoom, leaveRoom, clearMessages, connectionStatus, reconnectError, roomAccessError, endedRoomId, clearEndedRoom, unreadCount, participants, exitReason, clearExitReason, roomInfo } = useSocketStore();
   const { getLocalStream, localStream, localStreamState, screenStreamState, peers, peerStatuses, screenShares, toggleAudio, toggleVideo, shareScreen, broadcastMediaStream } = useWebRTC(id || "");
   const [isInviteModalOpen, setIsInviteModalOpen] = useState(false);
   const [mainScreenSource, setMainScreenSource] = useState<'url' | string>('url');
   const [roomCreatedAt, setRoomCreatedAt] = useState<string | null>(null);
+  const [sessionStartedAt, setSessionStartedAt] = useState<number | null>(null);
+  const [roomSettings, setRoomSettings] = useState<{ name: string; isPrivate: boolean; maxParticipants: number } | null>(null);
+  const [isRoomSettingsOpen, setIsRoomSettingsOpen] = useState(false);
+  const [isShortcutsOpen, setIsShortcutsOpen] = useState(false);
   const [roomDisplayId, setRoomDisplayId] = useState<string | null>(null);
   const [roomName, setRoomName] = useState<string | null>(null);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
-  const [isHost, setIsHost] = useState(false);
-  const [isChatOpen, setIsChatOpen] = useState(false);
+  const [hostId, setHostId] = useState<string | null>(null);
+  const [coHostIds, setCoHostIds] = useState<string[]>([]);
+  const isHost = !!user && (hostId === user.id || coHostIds.includes(user.id));
+  const isRoomHost = !!user && hostId === user.id;
+  const [isChatOpen, setIsChatOpen] = useState(() => typeof window !== "undefined" && window.innerWidth >= 1280);
+  const [passwordPrompt, setPasswordPrompt] = useState<{ open: boolean; error: string | null }>({ open: false, error: null });
+  const [codeCopied, setCodeCopied] = useState(false);
+  const mediaStartedRef = useRef(false);
   const [hoverZones, setHoverZones] = useState({ top: false, right: false, bottom: false });
   const [isCameraSidebarOpen, setIsCameraSidebarOpen] = useState(true);
   const [isFullscreen, setIsFullscreen] = useState(false);
@@ -39,21 +55,9 @@ export default function Room() {
   const mainContainerRef = useRef<HTMLDivElement>(null);
   const videoPlayerRef = useRef<VideoPlayerRef>(null);
 
-  const insertTimestamp = () => {
-    if (!videoPlayerRef.current) return;
-    const currentSeconds = Math.floor(videoPlayerRef.current.getCurrentTime());
-    const h = Math.floor(currentSeconds / 3600);
-    const m = Math.floor((currentSeconds % 3600) / 60);
-    const s = currentSeconds % 60;
-    
-    let timeStr = "";
-    if (h > 0) {
-      timeStr = `${h}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
-    } else {
-      timeStr = `${m}:${s.toString().padStart(2, '0')}`;
-    }
-    
-    setChatInput(prev => `${prev} [Time: ${timeStr}] `);
+  const getTimestamp = () => {
+    if (!videoPlayerRef.current) return null;
+    return formatClock(videoPlayerRef.current.getCurrentTime());
   };
 
   const handleSeekToTime = (timeStr: string) => {
@@ -65,29 +69,6 @@ export default function Room() {
     socket?.emit("seek_video", { roomId: id, time: seconds });
     socket?.emit("play_video", { roomId: id, time: seconds });
     videoPlayerRef.current?.seekTo(seconds);
-  };
-
-  const parseMessageContent = (content: string) => {
-    const timeRegex = /\[Time:\s*(\d{1,2}:\d{2}(?::\d{2})?)\]/g;
-    const parts = content.split(timeRegex);
-    
-    if (parts.length === 1) return content;
-    
-    return parts.map((part, i) => {
-      if (i % 2 === 1) { // It's the timeMatch
-        return (
-          <button 
-            key={i} 
-            onClick={() => handleSeekToTime(part)} 
-            className="text-indigo-300 hover:text-indigo-200 font-mono underline mx-1 hover:bg-white/10 px-1 rounded transition-colors"
-            title={isHost ? "Jump to time" : "Only the host can seek the video"}
-          >
-            {part}
-          </button>
-        );
-      }
-      return <span key={i}>{part}</span>;
-    });
   };
 
   const toggleFullscreen = () => {
@@ -131,7 +112,9 @@ export default function Room() {
     document.addEventListener("webkitfullscreenchange", handleFullscreenChange);
 
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key.toLowerCase() === 'f' && (e.target as Node)?.nodeName !== 'INPUT' && (e.target as Node)?.nodeName !== 'TEXTAREA') {
+      const target = e.target as HTMLElement | null;
+      const isTyping = target?.nodeName === 'INPUT' || target?.nodeName === 'TEXTAREA' || target?.isContentEditable;
+      if (e.key.toLowerCase() === 'f' && !e.metaKey && !e.ctrlKey && !e.altKey && !isTyping) {
         toggleFullscreen();
       }
     };
@@ -149,76 +132,103 @@ export default function Room() {
   const handleMouseLeaveBottom = () => setHoverZones(p => ({ ...p, bottom: false }));
   const handleMouseEnterBottom = () => setHoverZones(p => ({ ...p, bottom: true }));
 
-  useEffect(() => {
-    if (!user) {
-      navigate("/login", { state: { from: location.pathname } });
+  // Joining needs the camera/mic first so peers can negotiate immediately.
+  const startJoin = useCallback((password?: string) => {
+    if (!id || !user) return;
+    connect();
+    if (mediaStartedRef.current) {
+      joinRoom(id, user.id, user.name, password);
       return;
     }
+    mediaStartedRef.current = true;
+    // Fetch TURN credentials alongside media so the first peer connections can use them.
+    Promise.all([getLocalStream(), loadIceServers()]).then(() => {
+      joinRoom(id, user.id, user.name, password);
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [id, user?.id, user?.name, connect, joinRoom]);
 
-    if (id) {
-      api.get(`/rooms/${id}`).then((res) => {
-        if (res.data.room) {
-          setRoomCreatedAt(res.data.room.createdAt);
-          setRoomDisplayId(res.data.room.displayId);
-          setRoomName(res.data.room.name);
-          
-          let isUserHost = false;
-          if (res.data.room.hostId === user.id) {
-            isUserHost = true;
-          } else if (res.data.room.coHosts?.some((ch: { userId: string }) => ch.userId === user.id)) {
-            isUserHost = true;
-          }
-          setIsHost(isUserHost);
+  useEffect(() => {
+    if (!user || !id) return;
+    let cancelled = false;
 
-          let pwd = undefined;
-          if (res.data.room.isPrivate && !isUserHost) {
-            pwd = window.prompt("This room is private. Please enter the password:") || undefined;
-            if (pwd === undefined) {
-              navigate("/dashboard");
-              return;
-            }
-          }
+    api.get(`/rooms/${id}`).then((res) => {
+      const room = res.data.room;
+      if (cancelled || !room) return;
+      setRoomCreatedAt(room.createdAt);
+      setRoomDisplayId(room.displayId);
+      setRoomName(room.name);
+      setRoomSettings({ name: room.name, isPrivate: room.isPrivate, maxParticipants: room.maxParticipants ?? 10 });
+      setHostId(room.hostId);
+      const coHosts: string[] = (room.coHosts ?? []).map((ch: { userId: string }) => ch.userId);
+      setCoHostIds(coHosts);
 
-          connect();
-          getLocalStream().then(() => {
-            joinRoom(id, user.id, user.name, pwd);
-          });
-        }
-      }).catch(err => {
-        console.error("Failed to fetch room", err);
-        navigate("/dashboard");
-      });
-    }
+      const isPrivileged = room.hostId === user.id || coHosts.includes(user.id);
+      const passwordFromDashboard = (location.state as { password?: string } | null)?.password;
+      if (passwordFromDashboard) {
+        // Don't leave the room password sitting in browser history state.
+        navigate(location.pathname, { replace: true, state: null });
+      }
+      if (room.isPrivate && room.hasPassword !== false && !isPrivileged && !passwordFromDashboard) {
+        setPasswordPrompt({ open: true, error: null });
+        return;
+      }
+      startJoin(passwordFromDashboard);
+    }).catch(err => {
+      if (cancelled) return;
+      console.error("Failed to fetch room", err);
+      toast.error(getErrorMessage(err, "Room not found"));
+      navigate("/dashboard");
+    });
 
     return () => {
+      cancelled = true;
       if (id && user) {
         leaveRoom(id, user.id, user.name);
       }
       clearMessages();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [id, user]);
+  }, [id, user?.id]);
+
+  // The server rejected our password (wrong, or a reconnect lost it): ask again.
+  useEffect(() => {
+    if (!roomAccessError) return;
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setPasswordPrompt({
+      open: true,
+      error: roomAccessError === 'incorrect_password' ? "That password didn't work. Try again." : null,
+    });
+  }, [roomAccessError]);
+
+  useEffect(() => {
+    if (!endedRoomId || endedRoomId !== id) return;
+    clearEndedRoom();
+    toast.info("The host ended this room.");
+    navigate("/dashboard");
+  }, [endedRoomId, id, clearEndedRoom, navigate]);
 
   useEffect(() => {
     if (!socket || !user) return;
 
     const handleNewCohost = ({ userId }: { userId: string }) => {
+      setCoHostIds((prev) => (prev.includes(userId) ? prev : [...prev, userId]));
       if (userId === user.id) {
-        setIsHost(true);
+        toast.success("You're now a co-host and can control playback.");
       }
     };
 
-    const handleRoomState = ({ hostId, coHosts }: { hostId: string, coHosts: string[] }) => {
-      if (hostId === user.id || coHosts.includes(user.id)) {
-        setIsHost(true);
-      } else {
-        setIsHost(false);
-      }
+    const handleRoomState = ({ hostId: nextHostId, coHosts, startedAt }: { hostId: string, coHosts: string[], startedAt?: number }) => {
+      if (startedAt) setSessionStartedAt(startedAt);
+      setHostId(nextHostId);
+      setCoHostIds(coHosts);
     };
 
     const handleNewHost = ({ userId }: { userId: string }) => {
+      setHostId(userId);
+      setCoHostIds((prev) => prev.filter((uid) => uid !== userId));
       if (user.id === userId) {
-        setIsHost(true);
+        toast.success("You're the host now.");
       }
     };
 
@@ -233,17 +243,18 @@ export default function Room() {
   }, [socket, user]);
 
   useEffect(() => {
-    if (!roomCreatedAt) return;
+    const startMs = sessionStartedAt ?? (roomCreatedAt ? new Date(roomCreatedAt).getTime() : null);
+    if (!startMs) return;
     
     const interval = setInterval(() => {
-      const diff = Math.floor((Date.now() - new Date(roomCreatedAt).getTime()) / 1000);
+      const diff = Math.max(0, Math.floor((Date.now() - startMs) / 1000));
       const h = Math.floor(diff / 3600).toString().padStart(2, '0');
       const m = Math.floor((diff % 3600) / 60).toString().padStart(2, '0');
       const s = (diff % 60).toString().padStart(2, '0');
       setDuration(`${h}:${m}:${s}`);
     }, 1000);
     return () => clearInterval(interval);
-  }, [roomCreatedAt]);
+  }, [roomCreatedAt, sessionStartedAt]);
 
   // Automatically promote incoming screen-share / captured local video to main movie stage,
   // and cleanly revert to 'url' when the broadcast ends.
@@ -314,83 +325,124 @@ export default function Room() {
 
   useVoiceActivityDetection(id, localStreamState);
 
+  const shortcutHandlersRef = useRef({ toggleAudio, toggleVideo });
+  useEffect(() => {
+    shortcutHandlersRef.current = { toggleAudio, toggleVideo };
+  });
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement | null;
+      const isTyping = target?.nodeName === 'INPUT' || target?.nodeName === 'TEXTAREA' || target?.nodeName === 'SELECT' || target?.isContentEditable;
+      if (isTyping || e.metaKey || e.ctrlKey || e.altKey || document.querySelector('[role="dialog"]')) return;
+      switch (e.key.toLowerCase()) {
+        case 'm':
+          shortcutHandlersRef.current.toggleAudio();
+          break;
+        case 'v':
+          shortcutHandlersRef.current.toggleVideo();
+          break;
+        case 'c':
+          setIsChatOpen((open) => !open);
+          break;
+        case 'i':
+          setIsInviteModalOpen(true);
+          break;
+        case '?':
+          setIsShortcutsOpen(true);
+          break;
+      }
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, []);
+
   const addActiveSpeaker = useAudioStore(state => state.addActiveSpeaker);
   const removeActiveSpeaker = useAudioStore(state => state.removeActiveSpeaker);
   const setHostAnnouncement = useAudioStore(state => state.setHostAnnouncement);
+  const setHostSocketId = useAudioStore(state => state.setHostSocketId);
+
+  // Smart volume ducks deeper when the host talks; it needs the host's socket id.
+  useEffect(() => {
+    const hostSocket = Object.values(participants).find((p) => p.userId === hostId)?.socketId ?? null;
+    setHostSocketId(hostSocket);
+  }, [participants, hostId, setHostSocketId]);
+
+  useEffect(() => () => setHostSocketId(null), [setHostSocketId]);
+
+  useEffect(() => {
+    if (!exitReason) return;
+    clearExitReason();
+    if (exitReason === 'kicked') {
+      toast.error("You were removed from this room by the host.");
+    } else {
+      toast.error("This room is full.");
+    }
+    navigate("/dashboard");
+  }, [exitReason, clearExitReason, navigate]);
+
+  useEffect(() => {
+    if (!roomInfo) return;
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setRoomName(roomInfo.name);
+    setRoomSettings(roomInfo);
+  }, [roomInfo]);
 
   useEffect(() => {
     if (!socket) return;
 
-    socket.on("user_speaking", ({ socketId }) => {
-      addActiveSpeaker(socketId);
-    });
+    const isNativeFullscreen = () => !!(
+      document.fullscreenElement ||
+      (document as Document & { webkitFullscreenElement?: Element }).webkitFullscreenElement
+    );
 
-    socket.on("user_stopped_speaking", ({ socketId }) => {
-      removeActiveSpeaker(socketId);
-    });
+    const handleUserSpeaking = ({ socketId }: { socketId: string }) => addActiveSpeaker(socketId);
+    const handleUserStoppedSpeaking = ({ socketId }: { socketId: string }) => removeActiveSpeaker(socketId);
+    const handleAnnouncementStart = () => setHostAnnouncement(true);
+    const handleAnnouncementStop = () => setHostAnnouncement(false);
 
-    socket.on("host_announcement_start", () => {
-      setHostAnnouncement(true);
-    });
-
-    socket.on("host_announcement_stop", () => {
-      setHostAnnouncement(false);
-    });
-
-    socket.on("screen_share_start", ({ streamId }) => {
-      const isFs = !!(
-        document.fullscreenElement ||
-        (document as Document & { webkitFullscreenElement?: Element }).webkitFullscreenElement
-      );
-      if (isFs) {
+    const handleScreenShareStart = ({ streamId }: { streamId: string }) => {
+      if (isNativeFullscreen()) {
         pendingMainScreenSourceRef.current = streamId;
       } else {
         setMainScreenSource(streamId);
       }
-    });
+    };
 
-    socket.on("screen_share_stop", () => {
-      const isFs = !!(
-        document.fullscreenElement ||
-        (document as Document & { webkitFullscreenElement?: Element }).webkitFullscreenElement
-      );
-      if (isFs) {
+    const handleScreenShareStop = () => {
+      if (isNativeFullscreen()) {
         pendingMainScreenSourceRef.current = 'url';
       } else {
         setMainScreenSource('url');
       }
-    });
+    };
 
-    socket.on("new_cohost", ({ userId }) => {
-      if (user && user.id === userId) {
-        setIsHost(true);
-      }
-    });
+    socket.on("user_speaking", handleUserSpeaking);
+    socket.on("user_stopped_speaking", handleUserStoppedSpeaking);
+    socket.on("host_announcement_start", handleAnnouncementStart);
+    socket.on("host_announcement_stop", handleAnnouncementStop);
+    socket.on("screen_share_start", handleScreenShareStart);
+    socket.on("screen_share_stop", handleScreenShareStop);
 
     return () => {
-      socket.off("user_speaking");
-      socket.off("user_stopped_speaking");
-      socket.off("host_announcement_start");
-      socket.off("host_announcement_stop");
-      socket.off("screen_share_start");
-      socket.off("screen_share_stop");
-      socket.off("new_cohost");
+      socket.off("user_speaking", handleUserSpeaking);
+      socket.off("user_stopped_speaking", handleUserStoppedSpeaking);
+      socket.off("host_announcement_start", handleAnnouncementStart);
+      socket.off("host_announcement_stop", handleAnnouncementStop);
+      socket.off("screen_share_start", handleScreenShareStart);
+      socket.off("screen_share_stop", handleScreenShareStop);
     };
-  }, [socket, addActiveSpeaker, removeActiveSpeaker, setHostAnnouncement, user]);
+  }, [socket, addActiveSpeaker, removeActiveSpeaker, setHostAnnouncement]);
 
-  useEffect(() => {
-    if (chatRef.current) {
-      chatRef.current.scrollTop = chatRef.current.scrollHeight;
+  const handleCopyCode = async () => {
+    if (!roomDisplayId) return;
+    if (await copyToClipboard(roomDisplayId)) {
+      setCodeCopied(true);
+      setTimeout(() => setCodeCopied(false), 1500);
     }
-  }, [messages]);
-
-  const handleSendChat = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!chatInput.trim() || !id || !user) return;
-    
-    sendMessage(id, user.id, user.name, chatInput);
-    setChatInput("");
   };
+
+  const participantName = (socketId: string) => participants[socketId]?.userName ?? `Participant ${socketId.slice(0, 4)}`;
 
   const toggleHostAnnouncement = () => {
     if (!socket || !id) return;
@@ -427,23 +479,28 @@ export default function Room() {
           <div className="absolute top-0 bottom-0 right-0 w-4 z-[9999]" onMouseEnter={() => setHoverZones(p => ({ ...p, right: true }))} />
           <div className="absolute bottom-0 left-0 right-0 h-4 z-[9999]" onMouseEnter={handleMouseEnterBottom} />
           {hostAnnouncementActive && (
-            <div className="absolute top-4 left-1/2 -translate-x-1/2 z-50 bg-red-600 text-white px-6 py-2 rounded-full font-bold shadow-[0_0_20px_rgba(220,38,38,0.6)] animate-pulse flex items-center gap-2">
-              <Mic2 size={18} />
-              Host is Speaking
+            <div className="absolute top-4 left-1/2 -translate-x-1/2 z-[9600] flex items-center gap-2 rounded-full border border-red-400/40 bg-red-600/90 px-5 py-2 text-sm font-semibold text-white shadow-[0_0_30px_rgba(220,38,38,0.5)] backdrop-blur animate-fade-up">
+              <span className="relative flex h-2.5 w-2.5">
+                <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-white/80" />
+                <span className="relative inline-flex h-2.5 w-2.5 rounded-full bg-white" />
+              </span>
+              <Mic2 size={16} />
+              Host is speaking
             </div>
           )}
           {connectionStatus === 'reconnecting' && !reconnectError && (
-            <div className="absolute top-16 left-1/2 -translate-x-1/2 z-50 bg-amber-600/90 text-white px-4 py-1.5 rounded-full text-xs font-semibold shadow-lg backdrop-blur flex items-center gap-2 pointer-events-none animate-pulse">
-              <span className="w-2 h-2 rounded-full bg-white animate-ping" />
-              Reconnecting to room...
+            <div className="absolute top-16 left-1/2 -translate-x-1/2 z-[9600] flex items-center gap-2 rounded-full border border-amber-400/30 bg-amber-500/90 px-4 py-1.5 text-xs font-semibold text-black shadow-lg backdrop-blur pointer-events-none">
+              <WifiOff size={14} className="animate-pulse" />
+              Reconnecting to room…
             </div>
           )}
           {reconnectError && (
-            <div className="absolute top-16 left-1/2 -translate-x-1/2 z-50 bg-red-600/95 text-white px-4 py-1.5 rounded-full text-xs font-semibold shadow-lg backdrop-blur flex items-center gap-2 pointer-events-auto">
+            <div className="absolute top-16 left-1/2 -translate-x-1/2 z-[9600] flex items-center gap-2 rounded-full border border-red-400/30 bg-red-600/95 px-4 py-1.5 text-xs font-semibold text-white shadow-lg backdrop-blur pointer-events-auto">
+              <WifiOff size={14} />
               <span>Connection error: {reconnectError}</span>
               <button
                 onClick={() => window.location.reload()}
-                className="underline font-bold hover:text-red-100 ml-1"
+                className="ml-1 rounded-full bg-white/20 px-2 py-0.5 font-bold hover:bg-white/30"
               >
                 Retry
               </button>
@@ -463,25 +520,47 @@ export default function Room() {
                   pendingMainScreenSourceRef.current = null;
                   setMainScreenSource(e.target.value);
                 }}
-                className="bg-slate-900/80 text-white text-sm backdrop-blur-md px-3 py-1.5 rounded-lg border border-slate-700 shadow-lg focus:outline-none focus:border-indigo-500"
+                className="rounded-xl border border-white/10 bg-ink-900/80 px-3 py-2 text-sm font-medium text-white shadow-lg backdrop-blur-md focus:border-indigo-400/60 focus:outline-none"
+                aria-label="Main screen source"
               >
-                <option value="url">Video Player (YouTube)</option>
-                {screenStreamState && <option value={screenStreamState.id}>Your Screen</option>}
+                <option value="url">🎬 Video player</option>
+                {screenStreamState && <option value={screenStreamState.id}>🖥️ Your screen</option>}
                 {Object.entries(screenShares).map(([socketId, screenShareStream]) => {
                   const sId = typeof screenShareStream === "string" ? screenShareStream : (screenShareStream as MediaStream).id;
                   return (
-                    <option key={sId} value={sId}>Participant {socketId.slice(0,4)}'s Screen</option>
+                    <option key={sId} value={sId}>🖥️ {participantName(socketId)}'s screen</option>
                   );
                 })}
               </select>
             </div>
 
             {/* Room Info & Duration */}
-            <div className="absolute top-4 right-4 z-50 flex items-center gap-2">
-              <div className="bg-slate-900/80 text-white text-sm backdrop-blur-md px-3 py-1.5 rounded-lg border border-slate-700 shadow-lg font-medium hidden sm:block">
-                {roomDisplayId ? `Room ID: ${roomDisplayId} — ` : ''}{roomName || 'Room'}
+            <div className="absolute top-4 right-4 z-50 flex items-center gap-2 max-md:right-16">
+              <div className="hidden items-center gap-2 rounded-xl border border-white/10 bg-ink-900/80 py-1.5 pl-3 pr-1.5 text-sm text-white shadow-lg backdrop-blur-md sm:flex">
+                <span className="max-w-[14rem] truncate font-semibold">{roomName || 'Room'}</span>
+                {isRoomHost && roomSettings && (
+                  <button
+                    onClick={() => setIsRoomSettingsOpen(true)}
+                    className="rounded-lg p-1 text-slate-400 transition-colors hover:bg-white/10 hover:text-white"
+                    title="Room settings"
+                    aria-label="Room settings"
+                  >
+                    <SlidersHorizontal size={14} />
+                  </button>
+                )}
+                {roomDisplayId && (
+                  <button
+                    onClick={handleCopyCode}
+                    className="flex items-center gap-1 rounded-lg bg-white/10 px-2 py-0.5 font-mono text-xs text-slate-200 transition-colors hover:bg-white/20"
+                    title="Copy room code"
+                  >
+                    {roomDisplayId}
+                    {codeCopied ? <Check size={12} className="text-emerald-400" /> : <Copy size={12} />}
+                  </button>
+                )}
               </div>
-              <div className="bg-slate-900/80 text-white text-sm backdrop-blur-md px-3 py-1.5 rounded-lg border border-slate-700 shadow-lg font-mono">
+              <div className="flex items-center gap-1.5 rounded-xl border border-white/10 bg-ink-900/80 px-3 py-2 font-mono text-xs text-slate-200 shadow-lg backdrop-blur-md">
+                <span className="h-1.5 w-1.5 rounded-full bg-red-500 shadow-[0_0_6px] shadow-red-500" />
                 {duration}
               </div>
             </div>
@@ -494,7 +573,7 @@ export default function Room() {
                 className={isFullscreen ? "w-[100vw] h-[100vh] max-w-none max-h-none flex-1 flex" : "w-full h-full flex-1 flex"}
                 style={isFullscreen ? { width: '100vw', height: '100vh', maxWidth: 'none', maxHeight: 'none' } : undefined}
               >
-                <VideoPlayer ref={videoPlayerRef} roomId={id} isFullscreen={isFullscreen} isHost={isHost} broadcastMediaStream={broadcastMediaStream} shareScreen={shareScreen} />
+                <VideoPlayer ref={videoPlayerRef} roomId={id} isFullscreen={isFullscreen} isHost={isHost} isRoomHost={isRoomHost} broadcastMediaStream={broadcastMediaStream} shareScreen={shareScreen} />
               </div>
             ) : null
           ) : (
@@ -510,7 +589,7 @@ export default function Room() {
                     className={isFullscreen ? "w-[100vw] h-[100vh] max-w-none max-h-none flex-1 flex" : "w-full h-full flex-1 flex"}
                     style={isFullscreen ? { width: '100vw', height: '100vh', maxWidth: 'none', maxHeight: 'none' } : undefined}
                   >
-                    <VideoPlayer ref={videoPlayerRef} roomId={id} isFullscreen={isFullscreen} isHost={isHost} broadcastMediaStream={broadcastMediaStream} shareScreen={shareScreen} />
+                    <VideoPlayer ref={videoPlayerRef} roomId={id} isFullscreen={isFullscreen} isHost={isHost} isRoomHost={isRoomHost} broadcastMediaStream={broadcastMediaStream} shareScreen={shareScreen} />
                   </div>
                 ) : null;
               }
@@ -542,7 +621,7 @@ export default function Room() {
             className={`absolute top-0 right-0 bottom-0 w-32 z-[9000] flex flex-col items-end justify-center pr-4 transition-opacity duration-300 ${hoverZones.right ? 'opacity-100 pointer-events-auto' : 'opacity-0 md:pointer-events-none max-md:opacity-100 max-md:pointer-events-auto max-md:w-16'}`}
             onMouseLeave={() => setHoverZones(p => ({ ...p, right: false }))}
           >
-            <div className="flex flex-col gap-2">
+            <div className="flex flex-col items-center gap-2">
               {(!isCameraSidebarOpen || isFullscreen) && (
                 <button 
                   onClick={() => {
@@ -551,10 +630,11 @@ export default function Room() {
                     }
                     setIsCameraSidebarOpen(true);
                   }}
-                  className="bg-slate-800/90 hover:bg-indigo-600 text-white p-2.5 rounded-xl backdrop-blur shadow-lg transition-all border border-slate-700 flex items-center justify-center group"
-                  title="Open Cameras Sidebar"
+                  className="group grid h-11 w-11 place-items-center rounded-xl border border-white/10 bg-ink-900/80 text-slate-200 shadow-lg backdrop-blur transition-colors hover:bg-indigo-500/30 hover:text-white"
+                  title="Open cameras"
+                  aria-label="Open cameras"
                 >
-                  <Users size={20} className="group-hover:-translate-x-1 transition-transform" />
+                  <Users size={20} className="transition-transform group-hover:-translate-x-0.5" />
                 </button>
               )}
               {(!isChatOpen || isFullscreen) && (
@@ -565,22 +645,41 @@ export default function Room() {
                     }
                     setIsChatOpen(true);
                   }}
-                  className="bg-slate-800/90 hover:bg-indigo-600 text-white p-2.5 rounded-xl backdrop-blur shadow-lg transition-all border border-slate-700 flex items-center justify-center group"
-                  title="Open Live Chat"
+                  className="group relative grid h-11 w-11 place-items-center rounded-xl border border-white/10 bg-ink-900/80 text-slate-200 shadow-lg backdrop-blur transition-colors hover:bg-indigo-500/30 hover:text-white"
+                  title="Open chat"
+                  aria-label={unreadCount > 0 ? `Open chat, ${unreadCount} unread` : "Open chat"}
                 >
-                  <MessageSquare size={20} className="group-hover:-translate-x-1 transition-transform" />
+                  <MessageSquare size={20} className="transition-transform group-hover:-translate-x-0.5" />
+                  {unreadCount > 0 && (
+                    <span className="absolute -right-1.5 -top-1.5 min-w-[20px] rounded-full bg-fuchsia-500 px-1.5 py-0.5 text-center text-[10px] font-bold leading-none text-white shadow-lg animate-scale-in">
+                      {unreadCount > 99 ? "99+" : unreadCount}
+                    </span>
+                  )}
                 </button>
               )}
-              
+              <button
+                onClick={() => setIsInviteModalOpen(true)}
+                className="grid h-11 w-11 place-items-center rounded-xl border border-white/10 bg-ink-900/80 text-slate-200 shadow-lg backdrop-blur transition-colors hover:bg-indigo-500/30 hover:text-white"
+                title="Invite people"
+                aria-label="Invite people"
+              >
+                <Share2 size={18} />
+              </button>
+              {id && <ReactionPicker roomId={id} />}
+
               <button 
                 onClick={() => navigate('/dashboard')}
-                className="bg-red-600/90 hover:bg-red-500 text-white p-2.5 rounded-xl backdrop-blur shadow-[0_0_15px_rgba(220,38,38,0.4)] transition-all border border-red-500 flex items-center justify-center group mt-4"
-                title="Exit Room"
+                className="mt-3 grid h-11 w-11 place-items-center rounded-xl border border-red-400/40 bg-red-600/90 text-white shadow-[0_0_20px_rgba(220,38,38,0.35)] transition-colors hover:bg-red-500"
+                title="Leave room"
+                aria-label="Leave room"
               >
-                <div className="font-bold text-sm">EXIT</div>
+                <LogOut size={18} />
               </button>
             </div>
           </div>
+
+          {/* Floating emoji reactions (inside the fullscreen container so they stay visible) */}
+          <ReactionOverlay />
           
           {/* Floating Cameras (rendered here so they overlay the video) */}
           {id && (!isCameraSidebarOpen || isFullscreen) && (
@@ -607,10 +706,13 @@ export default function Room() {
       
       {/* Camera Sidebar */}
       {!isFullscreen && isCameraSidebarOpen && (
-        <div className="fixed md:relative right-0 w-full md:w-64 h-full bg-slate-900 border-l border-slate-800 flex flex-col shadow-2xl z-[9999] md:z-10 animate-in slide-in-from-right-8 duration-300">
-          <div className="p-3 border-b border-slate-800 flex justify-between items-center bg-slate-950">
-            <span className="font-semibold text-slate-200 text-sm flex items-center gap-2"><Users size={16}/> Cameras</span>
-            <button onClick={() => setIsCameraSidebarOpen(false)} className="text-slate-400 hover:text-white p-1 rounded hover:bg-slate-800 transition-colors">
+        <div className="fixed md:relative right-0 w-full md:w-64 h-full bg-ink-900/95 border-l border-white/5 flex flex-col shadow-2xl z-[9999] md:z-10 animate-slide-in-right backdrop-blur-xl">
+          <div className="px-3 py-2.5 border-b border-white/5 flex justify-between items-center">
+            <span className="font-semibold text-slate-200 text-sm flex items-center gap-2">
+              <Users size={16} className="text-indigo-300" /> Cameras
+              <span className="rounded-full bg-white/10 px-1.5 text-[10px] font-bold text-slate-300">{peers.length + 1}</span>
+            </span>
+            <button onClick={() => setIsCameraSidebarOpen(false)} className="btn-ghost px-2 py-1.5" aria-label="Close cameras">
               <ChevronRight size={18} />
             </button>
           </div>
@@ -637,75 +739,70 @@ export default function Room() {
       )}
 
       {/* Live Chat Sidebar */}
-      {!isFullscreen && isChatOpen && (
-        <div className="fixed md:relative right-0 w-full md:w-80 h-full bg-slate-950 border-l border-slate-900 flex flex-col shadow-2xl z-[9999] md:z-20 animate-in slide-in-from-right-8 duration-300">
-          <div className="p-4 border-b border-slate-900 font-semibold flex flex-col gap-2 bg-slate-900/50">
-            <div className="flex justify-between items-center">
-              <span className="flex items-center gap-2"><MessageSquare size={16}/> Live Chat</span>
-              <div className="flex gap-2 items-center">
-                <button 
-                  onClick={() => setIsInviteModalOpen(true)}
-                  className="text-xs flex items-center gap-1 bg-indigo-600 hover:bg-indigo-500 text-white px-3 py-1.5 rounded-full shadow-lg transition-colors"
-                >
-                  <Share2 size={12} />
-                  Invite Friends
-                </button>
-                <button onClick={() => setIsSettingsOpen(true)} className="text-slate-400 hover:text-white transition-colors">
-                  <Settings size={16} />
-                </button>
-                <button onClick={() => setIsChatOpen(false)} className="text-slate-400 hover:text-white p-1 rounded hover:bg-slate-800 transition-colors ml-1">
-                  <ChevronRight size={18} />
-                </button>
-              </div>
-            </div>
-            {isHost && (
-              <button 
-                onClick={toggleHostAnnouncement}
-                className={`text-sm py-1.5 px-3 rounded-lg font-medium border transition-colors flex justify-center items-center gap-2 ${hostAnnouncementActive ? 'bg-red-500/20 text-red-500 border-red-500/50' : 'bg-slate-800 text-slate-300 border-slate-700 hover:bg-slate-700'}`}
-              >
-                <Mic2 size={14} />
-                {hostAnnouncementActive ? 'Stop Announcement' : 'Host Announcement'}
-              </button>
-            )}
-          </div>
-          
-          <div ref={chatRef} className="flex-1 p-4 overflow-y-auto space-y-4">
-            {messages.map((msg, idx) => {
-              const isMe = msg.userId === user?.id;
-              return (
-                <div key={idx} className={`flex flex-col ${isMe ? 'items-end' : 'items-start'}`}>
-                  <span className="text-xs text-slate-500 mb-1">{isMe ? 'You' : msg.userName}</span>
-                  <div className={`px-3 py-2 rounded-2xl max-w-[85%] text-sm ${isMe ? 'bg-indigo-600 text-white rounded-br-none' : 'bg-slate-800 text-slate-200 rounded-bl-none'}`}>
-                    {parseMessageContent(msg.content)}
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-          
-          <div className="p-4 border-t border-slate-900 bg-slate-900/50">
-            <form onSubmit={handleSendChat} className="flex gap-2">
-              <input 
-                type="text" 
-                value={chatInput}
-                onChange={(e) => setChatInput(e.target.value)}
-                placeholder="Type a message..." 
-                className="flex-1 bg-slate-950 border border-slate-800 rounded-full px-4 py-2 text-sm text-slate-200 focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 transition-all" 
-              />
-              <button 
-                type="button" 
-                onClick={insertTimestamp}
-                className="bg-slate-800 hover:bg-slate-700 text-slate-300 p-2 rounded-full transition-colors flex items-center justify-center border border-slate-700"
-                title="Insert Video Timestamp"
-              >
-                <Clock size={16} />
-              </button>
-            </form>
-          </div>
-        </div>
+      {!isFullscreen && isChatOpen && id && user && (
+        <ChatPanel
+          roomId={id}
+          currentUser={user}
+          isHost={isHost}
+          hostId={hostId}
+          coHostIds={coHostIds}
+          hostAnnouncementActive={hostAnnouncementActive}
+          onToggleAnnouncement={toggleHostAnnouncement}
+          onSeek={handleSeekToTime}
+          getTimestamp={getTimestamp}
+          onOpenInvite={() => setIsInviteModalOpen(true)}
+          onOpenSettings={() => setIsSettingsOpen(true)}
+          onClose={() => setIsChatOpen(false)}
+          onMakeCoHost={(targetSocketId) => socket?.emit("make_cohost", { roomId: id, targetSocketId })}
+          onKick={(targetSocketId, name) => {
+            if (confirm(`Remove ${name} from this room? They can't rejoin until you allow them back in room settings.`)) {
+              socket?.emit("kick_participant", { roomId: id, targetSocketId });
+            }
+          }}
+        />
       )}
       <AudioSettingsModal isOpen={isSettingsOpen} onClose={() => setIsSettingsOpen(false)} />
-      {id && <InviteModal isOpen={isInviteModalOpen} onClose={() => setIsInviteModalOpen(false)} roomId={id} />}
+      {id && roomSettings && isRoomSettingsOpen && (
+        <RoomSettingsModal
+          isOpen
+          roomId={id}
+          initial={roomSettings}
+          onClose={() => setIsRoomSettingsOpen(false)}
+          onSaved={(next) => {
+            setRoomSettings(next);
+            setRoomName(next.name);
+          }}
+        />
+      )}
+      <Modal isOpen={isShortcutsOpen} onClose={() => setIsShortcutsOpen(false)} title="Keyboard shortcuts">
+        <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-2.5 p-5 text-sm">
+          {[
+            ["F", "Toggle fullscreen"],
+            ["M", "Mute / unmute microphone"],
+            ["V", "Turn camera on / off"],
+            ["C", "Open / close chat"],
+            ["I", "Invite people"],
+            ["?", "Show this help"],
+          ].map(([key, label]) => (
+            <div key={key} className="contents">
+              <dt><kbd className="rounded-md border border-white/15 bg-white/5 px-2 py-0.5 font-mono text-xs text-white">{key}</kbd></dt>
+              <dd className="text-slate-300">{label}</dd>
+            </div>
+          ))}
+        </dl>
+      </Modal>
+      {id && <InviteModal isOpen={isInviteModalOpen} onClose={() => setIsInviteModalOpen(false)} roomId={id} roomCode={roomDisplayId} />}
+      <PasswordPrompt
+        key={passwordPrompt.error ?? "prompt"}
+        isOpen={passwordPrompt.open}
+        roomName={roomName}
+        error={passwordPrompt.error}
+        onCancel={() => navigate("/dashboard")}
+        onSubmit={(password) => {
+          setPasswordPrompt({ open: false, error: null });
+          startJoin(password);
+        }}
+      />
     </div>
   );
 }

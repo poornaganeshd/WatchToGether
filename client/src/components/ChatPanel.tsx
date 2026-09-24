@@ -1,0 +1,476 @@
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { ArrowDown, ChevronDown, ChevronRight, ChevronUp, Clock, Crown, ListVideo, MessageSquare, Mic2, Play, Plus, SendHorizonal, Settings, Share2, Shield, SkipForward, Users, UserX, X } from "lucide-react";
+import { useSocketStore, type Message, type QueueItem } from "../store/useSocketStore";
+import Avatar from "./ui/Avatar";
+
+const TIMESTAMP_REGEX = /\[Time:\s*(\d{1,2}:\d{2}(?::\d{2})?)\]/g;
+const GROUP_WINDOW_MS = 2 * 60 * 1000;
+
+interface ChatPanelProps {
+  roomId: string;
+  currentUser: { id: string; name: string };
+  isHost: boolean;
+  hostId: string | null;
+  coHostIds: string[];
+  hostAnnouncementActive: boolean;
+  onToggleAnnouncement: () => void;
+  onSeek: (timeStr: string) => void;
+  getTimestamp: () => string | null;
+  onOpenInvite: () => void;
+  onOpenSettings: () => void;
+  onClose: () => void;
+  onMakeCoHost: (socketId: string) => void;
+  onKick: (socketId: string, name: string) => void;
+}
+
+const TYPING_IDLE_MS = 3000;
+
+const describeUrl = (url: string) => {
+  try {
+    const parsed = new URL(url);
+    const host = parsed.hostname.replace(/^www\./, "");
+    const ytId = parsed.searchParams.get("v") || (host === "youtu.be" ? parsed.pathname.slice(1) : null);
+    if (ytId) return { title: `YouTube · ${ytId}`, host, thumb: `https://i.ytimg.com/vi/${ytId}/mqdefault.jpg` };
+    const file = decodeURIComponent(parsed.pathname.split("/").filter(Boolean).pop() || host);
+    return { title: file, host, thumb: null };
+  } catch {
+    return { title: url, host: "", thumb: null };
+  }
+};
+
+const formatTime = (iso: string) => new Date(iso).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+
+export default function ChatPanel({
+  roomId, currentUser, isHost, hostId, coHostIds, hostAnnouncementActive, onToggleAnnouncement, onSeek, getTimestamp,
+  onOpenInvite, onOpenSettings, onClose, onMakeCoHost, onKick,
+}: ChatPanelProps) {
+  const messages = useSocketStore((s) => s.messages);
+  const participants = useSocketStore((s) => s.participants);
+  const sendMessage = useSocketStore((s) => s.sendMessage);
+  const setChatVisible = useSocketStore((s) => s.setChatVisible);
+  const setTyping = useSocketStore((s) => s.setTyping);
+  const typingUsers = useSocketStore((s) => s.typingUsers);
+  const queue = useSocketStore((s) => s.queue);
+  const skipVotes = useSocketStore((s) => s.skipVotes);
+  const viewerSync = useSocketStore((s) => s.viewerSync);
+  const socket = useSocketStore((s) => s.socket);
+  const [tab, setTab] = useState<"chat" | "queue" | "people">("chat");
+  const [queueUrl, setQueueUrl] = useState("");
+  const isTypingRef = useRef(false);
+  const typingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [input, setInput] = useState("");
+  const [isPinnedToBottom, setIsPinnedToBottom] = useState(true);
+  const listRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    setChatVisible(true);
+    return () => setChatVisible(false);
+  }, [setChatVisible]);
+
+  const stopTyping = () => {
+    if (typingTimerRef.current) clearTimeout(typingTimerRef.current);
+    if (isTypingRef.current) {
+      isTypingRef.current = false;
+      setTyping(roomId, false);
+    }
+  };
+
+  // Tell others we stopped typing if the panel closes mid-sentence.
+  useEffect(() => () => {
+    if (typingTimerRef.current) clearTimeout(typingTimerRef.current);
+    if (isTypingRef.current) setTyping(roomId, false);
+  }, [roomId, setTyping]);
+
+  const handleInputChange = (value: string) => {
+    setInput(value);
+    if (!value.trim()) {
+      stopTyping();
+      return;
+    }
+    if (!isTypingRef.current) {
+      isTypingRef.current = true;
+      setTyping(roomId, true);
+    }
+    if (typingTimerRef.current) clearTimeout(typingTimerRef.current);
+    typingTimerRef.current = setTimeout(stopTyping, TYPING_IDLE_MS);
+  };
+
+  const handleAddToQueue = (e: React.FormEvent) => {
+    e.preventDefault();
+    let url = queueUrl.trim();
+    if (!url) return;
+    if (!/^https?:\/\//i.test(url)) url = `https://${url}`;
+    socket?.emit("queue_add", { roomId, url });
+    setQueueUrl("");
+  };
+
+  const queueAction = (event: "queue_play" | "queue_remove", item: QueueItem) => socket?.emit(event, { roomId, itemId: item.id });
+  const moveItem = (item: QueueItem, direction: "up" | "down") => socket?.emit("queue_move", { roomId, itemId: item.id, direction });
+
+  useLayoutEffect(() => {
+    const el = listRef.current;
+    if (!el || tab !== "chat") return;
+    const lastIsMine = messages[messages.length - 1]?.userId === currentUser.id;
+    if (isPinnedToBottom || lastIsMine) {
+      el.scrollTop = el.scrollHeight;
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [messages, tab]);
+
+  const handleScroll = () => {
+    const el = listRef.current;
+    if (!el) return;
+    setIsPinnedToBottom(el.scrollHeight - el.scrollTop - el.clientHeight < 80);
+  };
+
+  const scrollToBottom = () => {
+    listRef.current?.scrollTo({ top: listRef.current.scrollHeight, behavior: "smooth" });
+  };
+
+  const handleSend = (e: React.FormEvent) => {
+    e.preventDefault();
+    const content = input.trim();
+    if (!content) return;
+    sendMessage(roomId, currentUser.id, currentUser.name, content.slice(0, 1000));
+    setInput("");
+    stopTyping();
+  };
+
+  const insertTimestamp = () => {
+    const ts = getTimestamp();
+    if (!ts) return;
+    setInput((prev) => `${prev}${prev && !prev.endsWith(" ") ? " " : ""}[Time: ${ts}] `);
+    inputRef.current?.focus();
+  };
+
+  const renderContent = (content: string) => {
+    const parts = content.split(TIMESTAMP_REGEX);
+    if (parts.length === 1) return content;
+    return parts.map((part, i) =>
+      i % 2 === 1 ? (
+        <button
+          key={i}
+          onClick={() => onSeek(part)}
+          disabled={!isHost}
+          className="mx-0.5 inline-flex items-center gap-1 rounded-md bg-black/25 px-1.5 py-0.5 font-mono text-[12px] text-indigo-200 transition-colors enabled:hover:bg-black/40 disabled:cursor-default"
+          title={isHost ? "Jump to this moment" : "Only hosts can seek"}
+        >
+          <Clock size={11} /> {part}
+        </button>
+      ) : (
+        <span key={i}>{part}</span>
+      )
+    );
+  };
+
+  const people = Object.values(participants)
+    // One entry per user even if they have several tabs open.
+    .filter((p, i, arr) => arr.findIndex((o) => o.userId === p.userId) === i)
+    .sort((a, b) => {
+      const rank = (uid: string) => (uid === hostId ? 0 : coHostIds.includes(uid) ? 1 : 2);
+      return rank(a.userId) - rank(b.userId) || a.userName.localeCompare(b.userName);
+    });
+
+  return (
+    <aside className="fixed inset-y-0 right-0 z-[9999] flex h-full w-full flex-col border-l border-white/5 bg-ink-900/95 shadow-2xl backdrop-blur-xl animate-slide-in-right md:relative md:z-20 md:w-80 lg:w-96">
+      <div className="flex items-center justify-between gap-2 border-b border-white/5 px-3 py-2.5">
+        <div className="flex rounded-lg bg-white/[0.04] p-0.5">
+          {([
+            { id: "chat", label: "Chat", icon: MessageSquare },
+            { id: "queue", label: queue.length ? `Queue · ${queue.length}` : "Queue", icon: ListVideo },
+            { id: "people", label: `${people.length}`, icon: Users },
+          ] as const).map(({ id, label, icon: Icon }) => (
+            <button
+              key={id}
+              onClick={() => setTab(id)}
+              className={`flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-xs font-semibold transition-colors ${tab === id ? "bg-white/10 text-white" : "text-slate-400 hover:text-slate-200"}`}
+              aria-label={id === "people" ? `People, ${people.length}` : undefined}
+            >
+              <Icon size={13} /> {label}
+            </button>
+          ))}
+        </div>
+        <div className="flex items-center gap-0.5">
+          <button onClick={onOpenInvite} className="btn-ghost px-2 py-1.5" title="Invite people" aria-label="Invite people">
+            <Share2 size={16} />
+          </button>
+          <button onClick={onOpenSettings} className="btn-ghost px-2 py-1.5" title="Audio settings" aria-label="Audio settings">
+            <Settings size={16} />
+          </button>
+          <button onClick={onClose} className="btn-ghost px-2 py-1.5" title="Close panel" aria-label="Close panel">
+            <ChevronRight size={18} />
+          </button>
+        </div>
+      </div>
+
+      {isHost && (
+        <div className="border-b border-white/5 px-3 py-2">
+          <button
+            onClick={onToggleAnnouncement}
+            className={`flex w-full items-center justify-center gap-2 rounded-lg border py-1.5 text-xs font-semibold transition-colors ${
+              hostAnnouncementActive
+                ? "border-red-500/40 bg-red-500/15 text-red-300"
+                : "border-white/10 bg-white/[0.03] text-slate-300 hover:bg-white/[0.07]"
+            }`}
+          >
+            <Mic2 size={13} className={hostAnnouncementActive ? "animate-pulse" : ""} />
+            {hostAnnouncementActive ? "Stop announcement" : "Host announcement"}
+          </button>
+        </div>
+      )}
+
+      {tab === "chat" ? (
+        <>
+          <div className="relative flex-1 overflow-hidden">
+            <div ref={listRef} onScroll={handleScroll} className="h-full overflow-y-auto px-3 py-4">
+              {messages.length === 0 ? (
+                <div className="flex h-full flex-col items-center justify-center text-center text-slate-500">
+                  <MessageSquare size={28} className="mb-2 opacity-50" />
+                  <p className="text-sm">No messages yet</p>
+                  <p className="text-xs">Say hi and get the party started 🎉</p>
+                </div>
+              ) : (
+                messages.map((msg, idx) => (
+                  <ChatMessage
+                    key={msg.id}
+                    msg={msg}
+                    prev={messages[idx - 1]}
+                    isMe={msg.userId === currentUser.id}
+                    isHostUser={msg.userId === hostId}
+                    render={renderContent}
+                  />
+                ))
+              )}
+            </div>
+            {!isPinnedToBottom && (
+              <button
+                onClick={scrollToBottom}
+                className="absolute bottom-3 left-1/2 flex -translate-x-1/2 items-center gap-1 rounded-full border border-white/10 bg-ink-800/95 px-3 py-1 text-xs font-medium text-slate-200 shadow-lg animate-fade-up"
+              >
+                <ArrowDown size={12} /> Latest
+              </button>
+            )}
+          </div>
+
+          {Object.keys(typingUsers).length > 0 && (
+            <div className="flex items-center gap-2 px-4 pb-1 text-[11px] text-slate-400 animate-fade-in" aria-live="polite">
+              <span className="flex gap-0.5">
+                {[0, 150, 300].map((d) => (
+                  <span key={d} className="h-1 w-1 animate-bounce rounded-full bg-slate-400" style={{ animationDelay: `${d}ms` }} />
+                ))}
+              </span>
+              {(() => {
+                const names = Array.from(new Set(Object.values(typingUsers)));
+                if (names.length === 1) return `${names[0]} is typing…`;
+                if (names.length === 2) return `${names[0]} and ${names[1]} are typing…`;
+                return "Several people are typing…";
+              })()}
+            </div>
+          )}
+
+          <form onSubmit={handleSend} className="flex items-center gap-2 border-t border-white/5 p-3">
+            <div className="flex flex-1 items-center rounded-xl border border-white/10 bg-ink-950/80 pr-1 focus-within:border-indigo-400/50 focus-within:ring-2 focus-within:ring-indigo-500/20">
+              <input
+                ref={inputRef}
+                type="text"
+                value={input}
+                maxLength={1000}
+                onChange={(e) => handleInputChange(e.target.value)}
+                onBlur={stopTyping}
+                placeholder="Send a message"
+                className="min-w-0 flex-1 bg-transparent px-3 py-2.5 text-sm text-slate-100 placeholder:text-slate-500 focus:outline-none"
+              />
+              <button
+                type="button"
+                onClick={insertTimestamp}
+                className="rounded-lg p-1.5 text-slate-400 transition-colors hover:bg-white/5 hover:text-white"
+                title="Insert current video time"
+                aria-label="Insert current video time"
+              >
+                <Clock size={16} />
+              </button>
+            </div>
+            <button type="submit" disabled={!input.trim()} className="btn-primary h-10 w-10 shrink-0 p-0" aria-label="Send message">
+              <SendHorizonal size={16} />
+            </button>
+          </form>
+        </>
+      ) : tab === "queue" ? (
+        <div className="flex flex-1 flex-col overflow-hidden">
+          <form onSubmit={handleAddToQueue} className="flex gap-2 border-b border-white/5 p-3">
+            <input
+              value={queueUrl}
+              onChange={(e) => setQueueUrl(e.target.value)}
+              placeholder="Suggest a video link"
+              className="input py-2"
+              maxLength={2000}
+            />
+            <button type="submit" disabled={!queueUrl.trim()} className="btn-primary h-10 w-10 shrink-0 p-0" aria-label="Add to queue">
+              <Plus size={16} />
+            </button>
+          </form>
+          {queue.length > 0 && (
+            <div className="flex items-center justify-between gap-2 border-b border-white/5 px-3 py-2">
+              <div className="text-xs text-slate-400">
+                <span className="font-semibold text-slate-200">{skipVotes.count}</span> of {skipVotes.needed} votes to skip
+                <div className="mt-1 h-1 w-32 overflow-hidden rounded-full bg-white/10">
+                  <div className="h-full rounded-full bg-gradient-to-r from-indigo-400 to-fuchsia-400 transition-all" style={{ width: `${Math.min(100, (skipVotes.count / Math.max(1, skipVotes.needed)) * 100)}%` }} />
+                </div>
+              </div>
+              {(() => {
+                const voted = skipVotes.voters.includes(currentUser.id);
+                return (
+                  <button
+                    onClick={() => socket?.emit("vote_skip", { roomId })}
+                    className={`${voted ? "btn-primary" : "btn-secondary"} px-3 py-1.5 text-xs`}
+                    aria-pressed={voted}
+                    title={voted ? "Withdraw your vote" : "Vote to skip to the next video"}
+                  >
+                    <SkipForward size={14} /> {voted ? "Voted" : "Vote skip"}
+                  </button>
+                );
+              })()}
+            </div>
+          )}
+          <div className="flex-1 space-y-2 overflow-y-auto p-3">
+            {queue.length === 0 ? (
+              <div className="flex h-full flex-col items-center justify-center text-center text-slate-500">
+                <ListVideo size={28} className="mb-2 opacity-50" />
+                <p className="text-sm">The queue is empty</p>
+                <p className="max-w-[16rem] text-xs">Add links here. {isHost ? "The next one plays automatically when the current video ends." : "The host decides what plays next."}</p>
+              </div>
+            ) : (
+              queue.map((item, index) => {
+                const info = describeUrl(item.url);
+                const canRemove = isHost || item.addedBy === currentUser.id;
+                return (
+                  <div key={item.id} className="group flex items-center gap-3 rounded-xl border border-white/5 bg-white/[0.02] p-2">
+                    <div className="relative grid h-12 w-20 shrink-0 place-items-center overflow-hidden rounded-lg bg-ink-800 text-slate-500">
+                      {info.thumb ? <img src={info.thumb} alt="" className="h-full w-full object-cover" loading="lazy" /> : <ListVideo size={18} />}
+                      <span className="absolute left-1 top-1 rounded bg-black/70 px-1 text-[10px] font-bold text-white">{index + 1}</span>
+                    </div>
+                    <div className="min-w-0 flex-1">
+                      <p className="truncate text-sm font-medium text-slate-100" title={item.url}>{info.title}</p>
+                      <p className="truncate text-[11px] text-slate-500">{info.host} · {item.addedBy === currentUser.id ? "you" : item.addedByName}</p>
+                    </div>
+                    <div className="flex shrink-0 items-center">
+                      {isHost && (
+                        <>
+                          <button onClick={() => queueAction("queue_play", item)} className="btn-ghost p-1.5 text-indigo-300" title="Play now" aria-label="Play now">
+                            <Play size={14} />
+                          </button>
+                          <div className="flex flex-col">
+                            <button onClick={() => moveItem(item, "up")} disabled={index === 0} className="text-slate-500 hover:text-white disabled:opacity-20" aria-label="Move up"><ChevronUp size={14} /></button>
+                            <button onClick={() => moveItem(item, "down")} disabled={index === queue.length - 1} className="text-slate-500 hover:text-white disabled:opacity-20" aria-label="Move down"><ChevronDown size={14} /></button>
+                          </div>
+                        </>
+                      )}
+                      {canRemove && (
+                        <button onClick={() => queueAction("queue_remove", item)} className="btn-ghost p-1.5 hover:text-red-300" title="Remove" aria-label="Remove from queue">
+                          <X size={14} />
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                );
+              })
+            )}
+          </div>
+        </div>
+      ) : (
+        <div className="flex-1 space-y-1 overflow-y-auto p-3">
+          {people.map((p) => {
+            const isRoomHost = p.userId === hostId;
+            const isCo = coHostIds.includes(p.userId);
+            return (
+              <div key={p.socketId} className="group flex items-center gap-3 rounded-xl p-2 hover:bg-white/[0.03]">
+                <Avatar name={p.userName} seed={p.userId} size={34} />
+                <div className="min-w-0 flex-1">
+                  <p className="truncate text-sm font-medium text-slate-100">
+                    {p.userName}
+                    {p.userId === currentUser.id && <span className="ml-1 text-slate-500">(you)</span>}
+                  </p>
+                  <p className="flex items-center gap-1.5 text-xs text-slate-500">
+                    {isRoomHost ? "Host" : isCo ? "Co-host" : "Viewer"}
+                    {!isRoomHost && <SyncBadge report={viewerSync[p.socketId]} />}
+                  </p>
+                </div>
+                {isRoomHost ? (
+                  <Crown size={15} className="text-amber-400" aria-label="Host" />
+                ) : isCo ? (
+                  <Shield size={15} className="text-indigo-300" aria-label="Co-host" />
+                ) : null}
+                {isHost && !isRoomHost && p.userId !== currentUser.id && (
+                  <div className="flex items-center opacity-60 transition-opacity group-hover:opacity-100">
+                    {hostId === currentUser.id && !isCo && (
+                      <button onClick={() => onMakeCoHost(p.socketId)} className="btn-ghost p-1.5 hover:text-amber-300" title="Make co-host" aria-label={`Make ${p.userName} co-host`}>
+                        <Crown size={14} />
+                      </button>
+                    )}
+                    {(!isCo || hostId === currentUser.id) && (
+                      <button onClick={() => onKick(p.socketId, p.userName)} className="btn-ghost p-1.5 hover:text-red-300" title="Remove from room" aria-label={`Remove ${p.userName}`}>
+                        <UserX size={14} />
+                      </button>
+                    )}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+          {people.length === 0 && <p className="py-8 text-center text-sm text-slate-500">Connecting…</p>}
+        </div>
+      )}
+    </aside>
+  );
+}
+
+function ChatMessage({
+  msg, prev, isMe, isHostUser, render,
+}: {
+  msg: Message;
+  prev?: Message;
+  isMe: boolean;
+  isHostUser: boolean;
+  render: (content: string) => React.ReactNode;
+}) {
+  const grouped = !!prev && prev.userId === msg.userId && new Date(msg.createdAt).getTime() - new Date(prev.createdAt).getTime() < GROUP_WINDOW_MS;
+
+  return (
+    <div className={`flex gap-2 ${isMe ? "flex-row-reverse" : ""} ${grouped ? "mt-0.5" : "mt-3 first:mt-0"}`}>
+      <div className="w-7 shrink-0">{!grouped && !isMe && <Avatar name={msg.userName} seed={msg.userId} size={28} />}</div>
+      <div className={`flex max-w-[80%] flex-col ${isMe ? "items-end" : "items-start"}`}>
+        {!grouped && (
+          <div className={`mb-1 flex items-center gap-1.5 text-[11px] ${isMe ? "flex-row-reverse" : ""}`}>
+            <span className="font-semibold text-slate-300">{isMe ? "You" : msg.userName}</span>
+            {isHostUser && <Crown size={10} className="text-amber-400" />}
+            <span className="text-slate-600">{formatTime(msg.createdAt)}</span>
+          </div>
+        )}
+        <div
+          className={`whitespace-pre-wrap break-words rounded-2xl px-3 py-2 text-sm leading-relaxed ${
+            isMe ? "rounded-tr-md bg-gradient-to-br from-indigo-500 to-violet-500 text-white" : "rounded-tl-md bg-white/[0.06] text-slate-200"
+          }`}
+          title={formatTime(msg.createdAt)}
+        >
+          {render(msg.content)}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function SyncBadge({ report }: { report?: { state: "synced" | "drifting" | "buffering" | "error"; drift: number } }) {
+  if (!report) return null;
+  const styles = {
+    synced: { dot: "bg-emerald-400", text: "text-emerald-300", label: "In sync" },
+    drifting: { dot: "bg-amber-400", text: "text-amber-300", label: `${report.drift > 0 ? "Behind" : "Ahead"} ${Math.abs(report.drift).toFixed(1)}s` },
+    buffering: { dot: "bg-amber-400 animate-pulse", text: "text-amber-300", label: "Buffering" },
+    error: { dot: "bg-red-400", text: "text-red-300", label: "Can't play" },
+  }[report.state];
+  return (
+    <span className={`inline-flex items-center gap-1 ${styles.text}`}>
+      · <span className={`h-1.5 w-1.5 rounded-full ${styles.dot}`} /> {styles.label}
+    </span>
+  );
+}

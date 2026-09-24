@@ -1,6 +1,8 @@
 import { create } from 'zustand';
 import { io, Socket } from 'socket.io-client';
 import { useAuthStore } from './useAuthStore';
+import { toast } from './useToastStore';
+import { rememberAvatars } from './useAvatarStore';
 
 export interface Message {
   id: string;
@@ -17,34 +19,121 @@ export interface RoomSession {
   password?: string;
 }
 
+export interface Participant {
+  socketId: string;
+  userId: string;
+  userName: string;
+  avatarVersion?: number | null;
+}
+
+export interface Subtitles {
+  label: string;
+  vtt: string;
+}
+
+export interface SkipVotes {
+  count: number;
+  needed: number;
+  voters: string[];
+}
+
+export type SyncState = 'synced' | 'drifting' | 'buffering' | 'error';
+
+export interface Reaction {
+  key: string;
+  emoji: string;
+  userName: string;
+}
+
+export interface QueueItem {
+  id: string;
+  url: string;
+  addedBy: string;
+  addedByName: string;
+}
+
+export interface RoomInfoUpdate {
+  name: string;
+  isPrivate: boolean;
+  maxParticipants: number;
+}
+
+export type RoomAccessError = 'password_required' | 'incorrect_password' | null;
+
+const MAX_MESSAGES = 300;
+
 interface SocketState {
   socket: Socket | null;
   messages: Message[];
-  participants: { userId: string; userName: string }[];
+  participants: Record<string, Participant>;
+  reactions: Reaction[];
+  unreadCount: number;
+  isChatVisible: boolean;
   connectionStatus: 'connected' | 'disconnected' | 'reconnecting';
   reconnectError: string | null;
+  roomAccessError: RoomAccessError;
+  endedRoomId: string | null;
+  exitReason: 'kicked' | 'full' | null;
+  queue: QueueItem[];
+  typingUsers: Record<string, string>; // socketId -> name
+  roomInfo: RoomInfoUpdate | null;
+  subtitles: Subtitles | null;
+  skipVotes: SkipVotes;
+  viewerSync: Record<string, { state: SyncState; drift: number }>;
   currentRoomSession: RoomSession | null;
   connect: () => void;
   disconnect: () => void;
   joinRoom: (roomId: string, userId: string, userName: string, password?: string) => void;
   leaveRoom: (roomId: string, userId: string, userName: string) => void;
   sendMessage: (roomId: string, userId: string, userName: string, content: string) => void;
+  sendReaction: (roomId: string, emoji: string) => void;
+  setTyping: (roomId: string, isTyping: boolean) => void;
   addMessage: (message: Message) => void;
   clearMessages: () => void;
+  setChatVisible: (visible: boolean) => void;
+  clearEndedRoom: () => void;
+  clearExitReason: () => void;
 }
+
+const typingTimers: Record<string, ReturnType<typeof setTimeout>> = {};
+
+const dropTyping = (typing: Record<string, string>, socketId: string) => {
+  if (!(socketId in typing)) return typing;
+  const next = { ...typing };
+  delete next[socketId];
+  return next;
+};
+
+const appendMessage = (messages: Message[], message: Message) => {
+  if (messages.some((m) => m.id === message.id)) return messages;
+  const next = [...messages, message];
+  return next.length > MAX_MESSAGES ? next.slice(next.length - MAX_MESSAGES) : next;
+};
 
 export const useSocketStore = create<SocketState>((set, get) => ({
   socket: null,
   messages: [],
-  participants: [],
+  participants: {},
+  reactions: [],
+  unreadCount: 0,
+  isChatVisible: false,
   connectionStatus: 'disconnected',
   reconnectError: null,
+  roomAccessError: null,
+  endedRoomId: null,
+  exitReason: null,
+  queue: [],
+  typingUsers: {},
+  roomInfo: null,
+  subtitles: null,
+  skipVotes: { count: 0, needed: 1, voters: [] },
+  viewerSync: {},
   currentRoomSession: null,
-  
+
   connect: () => {
     if (!get().socket) {
       const url = import.meta.env.VITE_API_URL || 'http://localhost:5000';
-      
+
       const socket = io(url, {
         auth: (cb) => {
           cb({ token: useAuthStore.getState().token });
@@ -67,25 +156,145 @@ export const useSocketStore = create<SocketState>((set, get) => ({
 
       socket.on('disconnect', (reason) => {
         console.warn("Socket disconnected:", reason);
-        set({ connectionStatus: 'reconnecting' });
+        set({ connectionStatus: 'reconnecting', participants: {} });
       });
 
       socket.on('connect_error', (err) => {
         console.error("Socket Connect Error:", err);
         set({ connectionStatus: 'reconnecting', reconnectError: err.message || "Failed to connect to server" });
       });
-      
+
       socket.on('receive_message', (message: Message) => {
-        set((state) => ({ messages: [...state.messages, message] }));
+        set((state) => ({
+          messages: appendMessage(state.messages, message),
+          typingUsers: Object.fromEntries(
+            Object.entries(state.typingUsers).filter(([, name]) => name !== message.userName)
+          ),
+          unreadCount:
+            state.isChatVisible || message.userId === useAuthStore.getState().user?.id
+              ? state.unreadCount
+              : state.unreadCount + 1,
+        }));
       });
-      
+
+      // The server replays recent messages on every (re)join, so replace rather than append.
+      socket.on('chat_history', (history: Message[]) => {
+        set({ messages: history.slice(-MAX_MESSAGES) });
+      });
+
+      socket.on('chat_rate_limited', ({ message }: { message: string }) => {
+        toast.error(message);
+      });
+
+      socket.on('room_participants', (list: Participant[]) => {
+        rememberAvatars(Object.fromEntries(list.map((p) => [p.userId, p.avatarVersion])));
+        set({ participants: Object.fromEntries(list.map((p) => [p.socketId, p])) });
+      });
+
+      socket.on('user_joined', ({ socketId, userId, userName, avatarVersion }: Participant) => {
+        rememberAvatars({ [userId]: avatarVersion });
+        set((state) => ({ participants: { ...state.participants, [socketId]: { socketId, userId, userName, avatarVersion } } }));
+      });
+
+      socket.on('subtitles_updated', (subtitles: Subtitles | null) => {
+        set({ subtitles });
+      });
+
+      socket.on('skip_votes', (skipVotes: SkipVotes) => {
+        set({ skipVotes });
+      });
+
+      socket.on('skip_passed', () => {
+        toast.info("The room voted to skip — playing the next video.");
+      });
+
+      socket.on('viewer_sync', ({ socketId, state, drift }: { socketId: string; state: SyncState; drift: number }) => {
+        set((s) => ({ viewerSync: { ...s.viewerSync, [socketId]: { state, drift } } }));
+      });
+
+      socket.on('viewer_sync_all', (reports: Record<string, { state: SyncState; drift: number }>) => {
+        set({ viewerSync: reports });
+      });
+
+      socket.on('user_left', ({ socketId }: { socketId: string }) => {
+        set((state) => {
+          const typingUsers = dropTyping(state.typingUsers, socketId);
+          const viewerSync = { ...state.viewerSync };
+          delete viewerSync[socketId];
+          if (!state.participants[socketId]) return { typingUsers, viewerSync };
+          const next = { ...state.participants };
+          delete next[socketId];
+          return { participants: next, typingUsers, viewerSync };
+        });
+      });
+
+      socket.on('user_typing', ({ socketId, userName, isTyping }: { socketId: string; userName: string; isTyping: boolean }) => {
+        clearTimeout(typingTimers[socketId]);
+        if (isTyping) {
+          set((state) => ({ typingUsers: { ...state.typingUsers, [socketId]: userName } }));
+          // Clear stale indicators if the "stopped" event never arrives.
+          typingTimers[socketId] = setTimeout(() => {
+            set((state) => ({ typingUsers: dropTyping(state.typingUsers, socketId) }));
+          }, 6000);
+        } else {
+          set((state) => ({ typingUsers: dropTyping(state.typingUsers, socketId) }));
+        }
+      });
+
+      socket.on('queue_updated', (queue: QueueItem[]) => {
+        set({ queue });
+      });
+
+      socket.on('room_updated', (info: RoomInfoUpdate) => {
+        set({ roomInfo: info });
+      });
+
+      socket.on('kicked', ({ roomId }: { roomId: string }) => {
+        if (get().currentRoomSession?.roomId === roomId) {
+          set({ exitReason: 'kicked', currentRoomSession: null });
+        }
+      });
+
+      socket.on('participant_kicked', ({ userName }: { userName: string }) => {
+        toast.info(`${userName} was removed from the room`);
+      });
+
+      socket.on('reaction', ({ emoji, userName, socketId }: { emoji: string; userName: string; socketId: string }) => {
+        const key = `${socketId}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+        set((state) => ({ reactions: [...state.reactions.slice(-20), { key, emoji, userName }] }));
+        setTimeout(() => {
+          set((state) => ({ reactions: state.reactions.filter((r) => r.key !== key) }));
+        }, 3200);
+      });
+
+      socket.on('room_ended', ({ roomId }: { roomId: string }) => {
+        if (get().currentRoomSession?.roomId === roomId) {
+          set({ endedRoomId: roomId, currentRoomSession: null });
+        }
+      });
+
       socket.on('error', (err: unknown) => {
         console.error("Socket Error:", err);
         const errorMsg = typeof err === 'object' && err !== null && 'message' in err
           ? String((err as { message?: string }).message)
           : String(err);
-        if (
-          errorMsg.includes("Password") ||
+        if (errorMsg.includes("removed from this room")) {
+          set({ exitReason: 'kicked', currentRoomSession: null });
+        } else if (errorMsg.includes("Room is full")) {
+          set({ exitReason: 'full', currentRoomSession: null });
+        } else if (
+          errorMsg.includes("Only the host") ||
+          errorMsg.includes("queue is full") ||
+          errorMsg.includes("too quickly") ||
+          errorMsg.includes("Nothing is queued") ||
+          errorMsg.includes("Subtitle file")
+        ) {
+          toast.error(errorMsg);
+        } else if (errorMsg.includes("Incorrect password")) {
+          set({ roomAccessError: 'incorrect_password' });
+        } else if (errorMsg.includes("Password required")) {
+          set({ roomAccessError: 'password_required' });
+        } else if (
           errorMsg.includes("Unauthorized userId mismatch") ||
           errorMsg.includes("Room not found")
         ) {
@@ -101,13 +310,19 @@ export const useSocketStore = create<SocketState>((set, get) => ({
     const { socket } = get();
     if (socket) {
       socket.disconnect();
-      set({ socket: null, currentRoomSession: null, connectionStatus: 'disconnected', reconnectError: null });
+      set({
+        socket: null,
+        currentRoomSession: null,
+        connectionStatus: 'disconnected',
+        reconnectError: null,
+        participants: {},
+      });
     }
   },
 
   joinRoom: (roomId, userId, userName, password) => {
     const session: RoomSession = { roomId, userId, userName, password };
-    set({ currentRoomSession: session, reconnectError: null });
+    set({ currentRoomSession: session, reconnectError: null, roomAccessError: null, endedRoomId: null, exitReason: null });
     const { socket } = get();
     if (socket && socket.connected) {
       socket.emit('join_room', session);
@@ -115,7 +330,7 @@ export const useSocketStore = create<SocketState>((set, get) => ({
   },
 
   leaveRoom: (roomId, userId, userName) => {
-    set({ currentRoomSession: null, reconnectError: null });
+    set({ currentRoomSession: null, reconnectError: null, roomAccessError: null, participants: {}, reactions: [], queue: [], typingUsers: {}, roomInfo: null, subtitles: null, skipVotes: { count: 0, needed: 1, voters: [] }, viewerSync: {} });
     const { socket } = get();
     if (socket) {
       socket.emit('leave_room', { roomId, userId, userName });
@@ -129,9 +344,23 @@ export const useSocketStore = create<SocketState>((set, get) => ({
     }
   },
 
-  addMessage: (message) => set((state) => ({ messages: [...state.messages, message] })),
-  
-  clearMessages: () => set({ messages: [] }),
+  sendReaction: (roomId, emoji) => {
+    get().socket?.emit('send_reaction', { roomId, emoji });
+  },
+
+  setTyping: (roomId, isTyping) => {
+    get().socket?.emit('typing', { roomId, isTyping });
+  },
+
+  addMessage: (message) => set((state) => ({ messages: appendMessage(state.messages, message) })),
+
+  clearMessages: () => set({ messages: [], unreadCount: 0 }),
+
+  setChatVisible: (visible) => set(visible ? { isChatVisible: true, unreadCount: 0 } : { isChatVisible: false }),
+
+  clearEndedRoom: () => set({ endedRoomId: null }),
+
+  clearExitReason: () => set({ exitReason: null }),
 }));
 
 if (typeof window !== 'undefined') {

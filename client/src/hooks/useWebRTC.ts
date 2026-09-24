@@ -1,11 +1,24 @@
 import { useEffect, useRef, useState } from "react";
 import { useSocketStore } from "../store/useSocketStore";
 import { useAuthStore } from "../store/useAuthStore";
+import { getIceServers } from "../lib/ice";
 import { classifyRemoteStream, type StreamStateContext } from "../utils/streamClassification";
 
 interface PeerConnection {
   [socketId: string]: RTCPeerConnection;
 }
+
+// Match senders by their transceiver's media kind. A sender whose track was replaced with null
+// could otherwise be an audio *or* video slot.
+const findSenderByKind = (pc: RTCPeerConnection, kind: "audio" | "video"): RTCRtpSender | undefined => {
+  if (typeof pc.getTransceivers === "function") {
+    const transceiver = pc.getTransceivers().find(
+      (t) => t.receiver?.track?.kind === kind || (t.sender?.track && t.sender.track.kind === kind)
+    );
+    if (transceiver) return transceiver.sender;
+  }
+  return pc.getSenders().find((s) => s.track?.kind === kind);
+};
 
 const findVideoSender = (pc: RTCPeerConnection): RTCRtpSender | undefined => {
   if (typeof pc.getTransceivers === "function") {
@@ -79,7 +92,13 @@ export function useWebRTC(roomId: string) {
             stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
           } catch (retryErr) {
             console.warn("Retry failed, falling back to audio-only (preserving wt_pref_camera preference):", retryErr);
-            stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            try {
+              stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            } catch (audioErr) {
+              // No microphone (or it was denied) but a camera may still work.
+              console.warn("Audio-only failed, trying camera-only:", audioErr);
+              stream = await navigator.mediaDevices.getUserMedia({ video: true });
+            }
             // IMPORTANT: Never write wt_pref_camera = 'false' here on transient hardware failure
           }
         }
@@ -104,10 +123,15 @@ export function useWebRTC(roomId: string) {
 
       return stream;
     } catch (err) {
-      console.error("Failed to get any local stream", err);
-      if (resolveMedia) resolveMedia(null);
+      // No usable devices or permission denied: join as a receive-only participant with an empty
+      // stream, so peer connections are still created and camera/mic can be enabled later.
+      console.error("Failed to get any local stream, joining without camera/mic", err);
+      const emptyStream = new MediaStream();
+      localStream.current = emptyStream;
+      setLocalStreamState(emptyStream);
+      if (resolveMedia) resolveMedia(emptyStream);
       socket?.emit("participant_status", { roomId, cam: false, mic: false });
-      return null;
+      return emptyStream;
     }
   };
 
@@ -118,12 +142,7 @@ export function useWebRTC(roomId: string) {
     if (!socket || !user) return;
 
     const createPeerConnection = (peerSocketId: string, stream: MediaStream) => {
-      const pc = new RTCPeerConnection({
-        iceServers: [
-          { urls: "stun:stun.l.google.com:19302" },
-          { urls: "stun:stun1.l.google.com:19302" },
-        ],
-      });
+      const pc = new RTCPeerConnection({ iceServers: getIceServers() });
 
       pc.onicecandidate = (event) => {
         if (!isMounted || pc.signalingState === "closed") return;
@@ -211,6 +230,15 @@ export function useWebRTC(roomId: string) {
           console.warn("Could not pre-add video transceiver", e);
         }
       }
+      // Same for audio, so people without a microphone still receive everyone else's audio
+      // and can enable their mic later.
+      if (stream.getAudioTracks().length === 0 && typeof pc.addTransceiver === "function") {
+        try {
+          pc.addTransceiver("audio", { direction: "sendrecv", streams: [stream] });
+        } catch (e) {
+          console.warn("Could not pre-add audio transceiver", e);
+        }
+      }
 
       if (screenStreamRef.current) {
         screenStreamRef.current.getTracks().forEach((track) => {
@@ -231,7 +259,7 @@ export function useWebRTC(roomId: string) {
       return false;
     };
 
-    socket.on("user_joined", async ({ socketId }) => {
+    const handleUserJoined = async ({ socketId }: { socketId: string }) => {
       if (!isMounted) return;
       const ready = await waitForMedia();
       if (!isMounted || !ready) return;
@@ -254,19 +282,22 @@ export function useWebRTC(roomId: string) {
       if (screenStreamRef.current) {
         socket.emit("screen_share_start", { roomId, streamId: screenStreamRef.current.id });
       }
-    });
+    };
+    socket.on("user_joined", handleUserJoined);
 
-    socket.on("participant_status", ({ socketId, cam, mic }) => {
+    const handleParticipantStatus = ({ socketId, cam, mic }: { socketId: string; cam: boolean; mic: boolean }) => {
       if (!isMounted) return;
       setPeerStatuses((prev) => ({ ...prev, [socketId]: { cam, mic } }));
-    });
+    };
+    socket.on("participant_status", handleParticipantStatus);
 
-    socket.on("room_participant_statuses", (statuses: Record<string, { cam: boolean; mic: boolean }>) => {
+    const handleRoomParticipantStatuses = (statuses: Record<string, { cam: boolean; mic: boolean }>) => {
       if (!isMounted) return;
       setPeerStatuses((prev) => ({ ...prev, ...statuses }));
-    });
+    };
+    socket.on("room_participant_statuses", handleRoomParticipantStatuses);
 
-    socket.on("webrtc_offer", async ({ offer, from }) => {
+    const handleOffer = async ({ offer, from }: { offer: RTCSessionDescriptionInit; from: string }) => {
       if (!isMounted) return;
       const currentSession = useSocketStore.getState().currentRoomSession;
       if (!currentSession || currentSession.roomId !== roomId) return;
@@ -300,9 +331,10 @@ export function useWebRTC(roomId: string) {
       } catch (err) {
         console.error("Failed to handle offer", err);
       }
-    });
+    };
+    socket.on("webrtc_offer", handleOffer);
 
-    socket.on("webrtc_answer", async ({ answer, from }) => {
+    const handleAnswer = async ({ answer, from }: { answer: RTCSessionDescriptionInit; from: string }) => {
       if (!isMounted) return;
       const currentSession = useSocketStore.getState().currentRoomSession;
       if (!currentSession || currentSession.roomId !== roomId) return;
@@ -317,9 +349,10 @@ export function useWebRTC(roomId: string) {
           console.error("Failed to set answer", err);
         }
       }
-    });
+    };
+    socket.on("webrtc_answer", handleAnswer);
 
-    socket.on("webrtc_ice_candidate", async ({ candidate, from }) => {
+    const handleIceCandidate = async ({ candidate, from }: { candidate: RTCIceCandidateInit; from: string }) => {
       if (!isMounted) return;
       const currentSession = useSocketStore.getState().currentRoomSession;
       if (!currentSession || currentSession.roomId !== roomId) return;
@@ -338,9 +371,10 @@ export function useWebRTC(roomId: string) {
         if (!pendingCandidates.current[from]) pendingCandidates.current[from] = [];
         pendingCandidates.current[from].push(candidate);
       }
-    });
+    };
+    socket.on("webrtc_ice_candidate", handleIceCandidate);
 
-    socket.on("user_left", ({ socketId }) => {
+    const handleUserLeft = ({ socketId }: { socketId: string }) => {
       if (!isMounted) return;
       if (peerConnections.current[socketId]) {
         const pc = peerConnections.current[socketId];
@@ -364,9 +398,10 @@ export function useWebRTC(roomId: string) {
         delete next[socketId];
         return next;
       });
-    });
+    };
+    socket.on("user_left", handleUserLeft);
 
-    socket.on("screen_share_start", ({ socketId, streamId }) => {
+    const handleScreenShareStart = ({ socketId, streamId }: { socketId: string; streamId: string }) => {
       if (!isMounted) return;
       streamStateContext.current.screenShareStreamIds[socketId] = streamId;
 
@@ -385,9 +420,10 @@ export function useWebRTC(roomId: string) {
         ...prev,
         [socketId]: streamToPromote || prev[socketId] || streamId,
       }));
-    });
+    };
+    socket.on("screen_share_start", handleScreenShareStart);
 
-    socket.on("screen_share_stop", ({ socketId }) => {
+    const handleScreenShareStop = ({ socketId }: { socketId: string }) => {
       if (!isMounted) return;
       delete streamStateContext.current.screenShareStreamIds[socketId];
       setScreenShares((prev) => {
@@ -395,7 +431,8 @@ export function useWebRTC(roomId: string) {
         delete next[socketId];
         return next;
       });
-    });
+    };
+    socket.on("screen_share_stop", handleScreenShareStop);
 
     const handleSocketDisconnect = () => {
       if (!isMounted) return;
@@ -458,15 +495,15 @@ export function useWebRTC(roomId: string) {
       isMounted = false;
       
       // 1. Remove socket listeners
-      socket.off("user_joined");
-      socket.off("webrtc_offer");
-      socket.off("webrtc_answer");
-      socket.off("webrtc_ice_candidate");
-      socket.off("user_left");
-      socket.off("participant_status");
-      socket.off("room_participant_statuses");
-      socket.off("screen_share_start");
-      socket.off("screen_share_stop");
+      socket.off("user_joined", handleUserJoined);
+      socket.off("webrtc_offer", handleOffer);
+      socket.off("webrtc_answer", handleAnswer);
+      socket.off("webrtc_ice_candidate", handleIceCandidate);
+      socket.off("user_left", handleUserLeft);
+      socket.off("participant_status", handleParticipantStatus);
+      socket.off("room_participant_statuses", handleRoomParticipantStatuses);
+      socket.off("screen_share_start", handleScreenShareStart);
+      socket.off("screen_share_stop", handleScreenShareStop);
       socket.off("disconnect", handleSocketDisconnect);
       socket.off("connect", handleSocketConnect);
 
@@ -514,7 +551,7 @@ export function useWebRTC(roomId: string) {
         // 1. Disassociate RTP senders from video track on all peer connections
         await Promise.all(
           Object.values(peerConnections.current).map(async (pc) => {
-            const sender = findVideoSender(pc);
+            const sender = findSenderByKind(pc, "video") ?? findVideoSender(pc);
             if (sender && typeof sender.replaceTrack === "function") {
               await sender.replaceTrack(null).catch((e) => console.warn("replaceTrack(null) error:", e));
             }
@@ -542,7 +579,7 @@ export function useWebRTC(roomId: string) {
           // Attach new track to all peer connections
           await Promise.all(
             Object.values(peerConnections.current).map(async (pc) => {
-              const sender = findVideoSender(pc);
+              const sender = findSenderByKind(pc, "video") ?? findVideoSender(pc);
               if (sender && typeof sender.replaceTrack === "function") {
                 await sender.replaceTrack(newVideoTrack).catch((e) => console.warn("replaceTrack error:", e));
               } else {
@@ -587,9 +624,9 @@ export function useWebRTC(roomId: string) {
         localStorage.setItem('wt_pref_mic', 'true');
         
         Object.values(peerConnections.current).forEach((pc) => {
-          const sender = pc.getSenders().find((s) => s.track === null || (s.track && s.track.kind === 'audio'));
+          const sender = findSenderByKind(pc, 'audio');
           if (sender) {
-            sender.replaceTrack(newAudioTrack);
+            sender.replaceTrack(newAudioTrack).catch((e) => console.warn("replaceTrack(audio) error:", e));
           } else {
             pc.addTrack(newAudioTrack, localStream.current!);
           }

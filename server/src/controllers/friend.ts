@@ -1,6 +1,9 @@
 import { Response } from "express";
 import { PrismaClient } from "@prisma/client";
 import { AuthRequest } from "../middlewares/authMiddleware";
+import { findUserByEmail } from "./auth";
+import { presence } from "../managers/PresenceManager";
+import { RoomManager } from "../managers/RoomManager";
 
 const prisma = new PrismaClient();
 
@@ -15,22 +18,43 @@ export const getFriends = async (req: AuthRequest, res: Response): Promise<void>
         ]
       },
       include: {
-        user: { select: { id: true, name: true, email: true } },
-        friendUser: { select: { id: true, name: true, email: true } }
+        user: { select: { id: true, name: true, email: true, avatarUpdatedAt: true } },
+        friendUser: { select: { id: true, name: true, email: true, avatarUpdatedAt: true } }
       }
     });
     
+    const roomManager = req.app.get("roomManager") as RoomManager | undefined;
+    const liveRoomIds = new Map<string, string>(); // friend userId -> roomId
+
     // Normalize format
     const formattedFriends = friends.map(f => {
       const isSender = f.userId === userId;
-      const otherUser = isSender ? f.friendUser : f.user;
+      const { avatarUpdatedAt, ...otherUser } = isSender ? f.friendUser : f.user;
+      const accepted = f.status === "ACCEPTED";
+      // Presence is only shared between accepted friends.
+      const roomId = accepted ? roomManager?.getUserRoomId(otherUser.id) : undefined;
+      if (roomId) liveRoomIds.set(otherUser.id, roomId);
       return {
         id: f.id,
         status: f.status, // PENDING, ACCEPTED
         isSender,
-        user: otherUser
+        user: { ...otherUser, avatarVersion: avatarUpdatedAt ? avatarUpdatedAt.getTime() : null },
+        online: accepted && presence.isOnline(otherUser.id),
+        room: null as null | { id: string; name: string; displayId: string | null; isPrivate: boolean },
       };
     });
+
+    if (liveRoomIds.size > 0) {
+      const rooms = await prisma.room.findMany({
+        where: { id: { in: Array.from(new Set(liveRoomIds.values())) } },
+        select: { id: true, name: true, displayId: true, isPrivate: true },
+      });
+      const byId = new Map(rooms.map((r) => [r.id, r]));
+      for (const f of formattedFriends) {
+        const roomId = liveRoomIds.get(f.user.id);
+        f.room = roomId ? byId.get(roomId) ?? null : null;
+      }
+    }
 
     res.status(200).json({ friends: formattedFriends });
   } catch (error) {
@@ -44,12 +68,12 @@ export const sendFriendRequest = async (req: AuthRequest, res: Response): Promis
     const { email } = req.body;
     const userId = req.userId!;
 
-    if (!email) {
+    if (!email || typeof email !== "string") {
       res.status(400).json({ error: "Email is required" });
       return;
     }
 
-    const targetUser = await prisma.user.findUnique({ where: { email } });
+    const targetUser = await findUserByEmail(email);
     if (!targetUser) {
       res.status(404).json({ error: "User not found" });
       return;
@@ -70,7 +94,21 @@ export const sendFriendRequest = async (req: AuthRequest, res: Response): Promis
     });
 
     if (existing) {
-      res.status(400).json({ error: "Friend request already exists" });
+      // They already asked us: treat sending a request back as accepting theirs.
+      if (existing.status === "PENDING" && existing.friendId === userId) {
+        await prisma.friend.update({ where: { id: existing.id }, data: { status: "ACCEPTED" } });
+        const accepter = await prisma.user.findUnique({ where: { id: userId } });
+        const io = req.app.get("io");
+        if (io && accepter) {
+          io.to(`user_${targetUser.id}`).emit("notification", {
+            title: "Friend Request Accepted",
+            body: `${accepter.name} accepted your friend request!`
+          });
+        }
+        res.status(200).json({ message: "Friend request accepted", friend: { ...existing, status: "ACCEPTED" } });
+        return;
+      }
+      res.status(400).json({ error: existing.status === "ACCEPTED" ? "You are already friends" : "Friend request already exists" });
       return;
     }
 
@@ -108,13 +146,16 @@ export const acceptFriendRequest = async (req: AuthRequest, res: Response): Prom
       res.status(404).json({ error: "Request not found" });
       return;
     }
+    if (friend.status === "ACCEPTED") {
+      res.status(200).json({ message: "Friend request accepted" });
+      return;
+    }
 
     await prisma.friend.update({
       where: { id },
       data: { status: "ACCEPTED" }
     });
 
-    const targetUser = await prisma.user.findUnique({ where: { id: friend.userId } });
     const accepterUser = await prisma.user.findUnique({ where: { id: userId } });
     const io = req.app.get("io");
     if (io && accepterUser) {
@@ -127,6 +168,26 @@ export const acceptFriendRequest = async (req: AuthRequest, res: Response): Prom
     res.status(200).json({ message: "Friend request accepted" });
   } catch (error) {
     console.error("Accept Request Error:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+};
+
+export const removeFriend = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const id = req.params.id as string;
+    const userId = req.userId!;
+
+    const friend = await prisma.friend.findUnique({ where: { id } });
+    // Either side can decline, cancel, or unfriend.
+    if (!friend || (friend.userId !== userId && friend.friendId !== userId)) {
+      res.status(404).json({ error: "Friend not found" });
+      return;
+    }
+
+    await prisma.friend.delete({ where: { id } });
+    res.status(200).json({ message: "Friend removed" });
+  } catch (error) {
+    console.error("Remove Friend Error:", error);
     res.status(500).json({ error: "Internal server error" });
   }
 };

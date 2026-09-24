@@ -1,8 +1,11 @@
-import { useState, useRef, useEffect, forwardRef, useImperativeHandle } from "react";
+import { useState, useRef, useEffect, forwardRef, useImperativeHandle, useCallback } from "react";
 import ReactPlayer from "react-player";
 import { useSocketStore } from "../store/useSocketStore";
 import { useAudioStore } from "../store/useAudioStore";
-import { MonitorPlay } from "lucide-react";
+import { Captions, CaptionsOff, FileText, FileVideo, Link2, MonitorPlay, MonitorUp, RefreshCcw, Square, X } from "lucide-react";
+import SubtitleOverlay from "./SubtitleOverlay";
+import { toWebVtt } from "../lib/subtitles";
+import { toast } from "../store/useToastStore";
 
 export interface VideoPlayerRef {
   seekTo: (time: number) => void;
@@ -12,13 +15,19 @@ export interface VideoPlayerRef {
 interface VideoPlayerProps {
   roomId: string;
   isFullscreen?: boolean;
+  /** Host or co-host: may control playback for everyone. */
   isHost: boolean;
+  /** The single room host, whose player is the room's clock. */
+  isRoomHost?: boolean;
   broadcastMediaStream?: (stream: MediaStream) => void;
   shareScreen?: () => void;
 }
 
-const VideoPlayer = forwardRef<VideoPlayerRef, VideoPlayerProps>(({ roomId, isFullscreen = false, isHost, broadcastMediaStream, shareScreen }, ref) => {
+const VideoPlayer = forwardRef<VideoPlayerRef, VideoPlayerProps>(({ roomId, isFullscreen = false, isHost, isRoomHost = false, broadcastMediaStream, shareScreen }, ref) => {
   const { socket } = useSocketStore();
+  const subtitles = useSocketStore((s) => s.subtitles);
+  const [showSubtitles, setShowSubtitles] = useState(() => localStorage.getItem("wt_pref_subtitles") !== "false");
+  const bufferingRef = useRef(false);
   const [url, setUrl] = useState("https://www.youtube.com/watch?v=aqz-KE-bpKQ");
   const [inputUrl, setInputUrl] = useState("");
   const [playing, setPlaying] = useState(false);
@@ -29,6 +38,10 @@ const VideoPlayer = forwardRef<VideoPlayerRef, VideoPlayerProps>(({ roomId, isFu
   const isHandlingRemote = useRef(false);
   const isHostRef = useRef(isHost);
   isHostRef.current = isHost;
+  const isRoomHostRef = useRef(isRoomHost);
+  isRoomHostRef.current = isRoomHost;
+  // The host applies the server's saved state once when (re)joining, then acts as the clock.
+  const hostInitializedRef = useRef(false);
   const isFullscreenRef = useRef(isFullscreen);
   isFullscreenRef.current = isFullscreen;
   const urlRef = useRef(url);
@@ -150,6 +163,11 @@ const VideoPlayer = forwardRef<VideoPlayerRef, VideoPlayerProps>(({ roomId, isFu
     }
   };
 
+  const readCurrentTime = useCallback(() => {
+    const player = playerRef.current;
+    return player && typeof player.getCurrentTime === "function" ? player.getCurrentTime() || 0 : 0;
+  }, []);
+
   useImperativeHandle(ref, () => ({
     seekTo: (time: number) => {
       if (playerRef.current && typeof playerRef.current.seekTo === 'function') {
@@ -230,7 +248,6 @@ const VideoPlayer = forwardRef<VideoPlayerRef, VideoPlayerProps>(({ roomId, isFu
     if (!socket) return;
 
     const handlePlayVideo = ({ time, serverTime }: { time: number; serverTime?: number }) => {
-      if (isHostRef.current) return;
       if (pendingUrlRef.current && pendingUrlRef.current !== urlRef.current) return;
       markHandlingRemote(800);
       lastSyncStateRef.current = {
@@ -251,7 +268,6 @@ const VideoPlayer = forwardRef<VideoPlayerRef, VideoPlayerProps>(({ roomId, isFu
     };
 
     const handlePauseVideo = ({ time, serverTime }: { time: number; serverTime?: number }) => {
-      if (isHostRef.current) return;
       if (pendingUrlRef.current && pendingUrlRef.current !== urlRef.current) return;
       markHandlingRemote(800);
       lastSyncStateRef.current = {
@@ -269,7 +285,6 @@ const VideoPlayer = forwardRef<VideoPlayerRef, VideoPlayerProps>(({ roomId, isFu
     };
 
     const handleSeekVideo = ({ time, serverTime }: { time: number; serverTime?: number }) => {
-      if (isHostRef.current) return;
       if (pendingUrlRef.current && pendingUrlRef.current !== urlRef.current) return;
       markHandlingRemote(800);
       if (lastSyncStateRef.current) {
@@ -290,7 +305,7 @@ const VideoPlayer = forwardRef<VideoPlayerRef, VideoPlayerProps>(({ roomId, isFu
       }
       pendingUrlRef.current = null;
       setUrl(newUrl);
-      setPlaying(true);
+      setPlaying(!!newUrl);
       if (playerRef.current) {
         if (typeof playerRef.current.seekTo === 'function') playerRef.current.seekTo(0);
       }
@@ -299,7 +314,10 @@ const VideoPlayer = forwardRef<VideoPlayerRef, VideoPlayerProps>(({ roomId, isFu
 
     const handleSyncResponse = (playbackState: { time: number; playing: boolean; url: string; lastUpdatedAt?: number; serverTime?: number } | null) => {
       if (!playbackState) return;
-      if (isHostRef.current) return;
+      if (isRoomHostRef.current) {
+        if (hostInitializedRef.current) return;
+        hostInitializedRef.current = true;
+      }
 
       const { time, playing: hostPlaying, url: hostUrl, lastUpdatedAt, serverTime } = playbackState;
       markHandlingRemote(800);
@@ -350,9 +368,10 @@ const VideoPlayer = forwardRef<VideoPlayerRef, VideoPlayerProps>(({ roomId, isFu
     };
   }, [socket, roomId]);
 
-  // Host periodic heartbeat while playing
+  // Room-host heartbeat while playing. Co-hosts can control playback but follow the host's clock,
+  // otherwise two heartbeats fight each other.
   useEffect(() => {
-    if (!isHost || !playing || !socket) return;
+    if (!isRoomHost || !playing || !socket) return;
 
     const intervalId = setInterval(() => {
       if (playerRef.current && typeof playerRef.current.getCurrentTime === 'function') {
@@ -362,11 +381,11 @@ const VideoPlayer = forwardRef<VideoPlayerRef, VideoPlayerProps>(({ roomId, isFu
     }, 3000);
 
     return () => clearInterval(intervalId);
-  }, [isHost, playing, socket, roomId]);
+  }, [isRoomHost, playing, socket, roomId]);
 
-  // Non-host fallback polling if no heartbeat received for > 8s
+  // Fallback polling for everyone but the clock if no heartbeat received for > 8s
   useEffect(() => {
-    if (isHost || !socket) return;
+    if (isRoomHost || !socket) return;
     const intervalId = setInterval(() => {
       const lastReceived = lastSyncStateRef.current?.localReceiptTime || 0;
       if (Date.now() - lastReceived > 8000) {
@@ -374,13 +393,89 @@ const VideoPlayer = forwardRef<VideoPlayerRef, VideoPlayerProps>(({ roomId, isFu
       }
     }, 5000);
     return () => clearInterval(intervalId);
-  }, [isHost, socket, roomId]);
+  }, [isRoomHost, socket, roomId]);
+
+  // Viewers can't change playback: snap the player back to the room's state. Toggling the prop
+  // away and back forces ReactPlayer to re-apply it even though React state didn't change.
+  const revertToRoomState = () => {
+    const roomPlaying = lastSyncStateRef.current?.playing ?? false;
+    setPlaying(!roomPlaying);
+    setTimeout(() => setPlaying(roomPlaying), 10);
+    socket?.emit("request_sync", { roomId });
+  };
+
+  // Everyone except the room clock reports how well they're keeping up, so hosts can see
+  // who is buffering or drifting before pressing play.
+  const sendSyncReport = useCallback(() => {
+    if (!socket || isRoomHostRef.current || !urlRef.current) return;
+    const syncState = lastSyncStateRef.current;
+    let drift = 0;
+    if (syncState && playerRef.current && typeof playerRef.current.getCurrentTime === "function") {
+      drift = calculateExpectedTime(syncState) - (playerRef.current.getCurrentTime() || 0);
+    }
+    let state: "synced" | "drifting" | "buffering" | "error" = "synced";
+    if (erroredUrlRef.current === urlRef.current) state = "error";
+    else if (bufferingRef.current) state = "buffering";
+    else if (Math.abs(drift) > 1.5) state = "drifting";
+    socket.emit("playback_report", { roomId, state, drift: Number.isFinite(drift) ? drift : 0 });
+  }, [socket, roomId]);
+
+  useEffect(() => {
+    if (isRoomHost || !socket) return;
+    const id = setInterval(sendSyncReport, 4000);
+    return () => clearInterval(id);
+  }, [isRoomHost, socket, sendSyncReport]);
+
+  const handleBuffer = () => {
+    bufferingRef.current = true;
+    sendSyncReport();
+  };
+
+  const handleBufferEnd = () => {
+    bufferingRef.current = false;
+    sendSyncReport();
+  };
+
+  const handleSubtitleFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (!file) return;
+    if (file.size > 300 * 1024) {
+      toast.error("Subtitle files must be under 300 KB");
+      return;
+    }
+    const vtt = toWebVtt(await file.text());
+    if (!vtt.includes("-->")) {
+      toast.error("That doesn't look like an .srt or .vtt subtitle file");
+      return;
+    }
+    socket?.emit("subtitles_set", { roomId, label: file.name.replace(/\.(srt|vtt)$/i, "").slice(0, 100) || "Subtitles", vtt });
+  };
+
+  const toggleSubtitles = () => {
+    setShowSubtitles((v) => {
+      localStorage.setItem("wt_pref_subtitles", String(!v));
+      return !v;
+    });
+  };
+
+  const subtitleToggle = subtitles ? (
+    <button
+      type="button"
+      onClick={toggleSubtitles}
+      className="btn-secondary px-3 py-2 text-xs"
+      title={showSubtitles ? "Hide subtitles" : "Show subtitles"}
+    >
+      {showSubtitles ? <Captions size={14} /> : <CaptionsOff size={14} />}
+      {showSubtitles ? "Subtitles on" : "Subtitles off"}
+    </button>
+  ) : null;
 
   const handlePlay = () => {
     if (isHandlingRemote.current) return;
     if (!isHost) {
-      setPlaying(false); // Instantly revert if not host
-      setTimeout(() => setPlaying(true), 10); // Force re-render just in case
+      // Starting playback is fine if the room is playing (e.g. after an autoplay block).
+      if (!lastSyncStateRef.current?.playing) revertToRoomState();
       return;
     }
     setPlaying(true);
@@ -391,8 +486,7 @@ const VideoPlayer = forwardRef<VideoPlayerRef, VideoPlayerProps>(({ roomId, isFu
   const handlePause = () => {
     if (isHandlingRemote.current) return;
     if (!isHost) {
-      setPlaying(true); // Instantly revert if not host
-      setTimeout(() => setPlaying(false), 10);
+      if (lastSyncStateRef.current?.playing) revertToRoomState();
       return;
     }
     setPlaying(false);
@@ -402,12 +496,15 @@ const VideoPlayer = forwardRef<VideoPlayerRef, VideoPlayerProps>(({ roomId, isFu
 
   const handleSeek = (seconds: number) => {
     if (isHandlingRemote.current) return;
-    if (!isHostRef.current) return;
+    if (!isHostRef.current) {
+      socket?.emit("request_sync", { roomId });
+      return;
+    }
     socket?.emit("seek_video", { roomId, time: seconds });
   };
 
   const handleProgress = (state: { playedSeconds: number }) => {
-    if (isHostRef.current) return;
+    if (isRoomHostRef.current) return;
     if (!lastSyncStateRef.current || !lastSyncStateRef.current.playing) return;
     if (isHandlingRemote.current) return;
 
@@ -428,7 +525,13 @@ const VideoPlayer = forwardRef<VideoPlayerRef, VideoPlayerProps>(({ roomId, isFu
     }
   };
 
-  const [videoError, setVideoError] = useState(false);
+  const [erroredUrl, setErroredUrl] = useState<string | null>(null);
+  const erroredUrlRef = useRef<string | null>(null);
+  useEffect(() => {
+    erroredUrlRef.current = erroredUrl;
+  }, [erroredUrl]);
+  const videoError = !!url && erroredUrl === url;
+  const setVideoError = (failed: boolean) => setErroredUrl(failed ? urlRef.current : null);
 
   const changeVideo = (e: React.FormEvent) => {
     e.preventDefault();
@@ -444,6 +547,13 @@ const VideoPlayer = forwardRef<VideoPlayerRef, VideoPlayerProps>(({ roomId, isFu
       socket?.emit("change_video", { roomId, url: finalUrl });
       socket?.emit("play_video", { roomId, time: 0 });
       setInputUrl("");
+    }
+  };
+
+  const handleEnded = () => {
+    // The room host's player drives auto-advance through the watch queue.
+    if (isRoomHostRef.current) {
+      socket?.emit("queue_next", { roomId });
     }
   };
 
@@ -489,71 +599,80 @@ const VideoPlayer = forwardRef<VideoPlayerRef, VideoPlayerProps>(({ roomId, isFu
 
   return (
     <div className={`flex flex-col w-full h-full relative group transition-all duration-300 ${isFullscreen ? '' : 'p-4'}`}>
-      <div className={`absolute z-10 p-2 rounded-lg backdrop-blur-sm border border-slate-700 flex flex-col items-end transition-opacity duration-300 ${isFullscreen ? 'top-4 right-4' : 'top-6 right-6'} ${videoError ? 'opacity-100 bg-red-900/80 border-red-500/50' : 'opacity-0 group-hover:opacity-100 bg-slate-900/80'}`}>
+      <div className={`absolute z-10 flex flex-col items-end rounded-2xl border p-3 shadow-2xl backdrop-blur-xl transition-opacity duration-300 ${isFullscreen ? 'top-20 right-4' : 'top-20 right-6'} ${videoError ? 'opacity-100 bg-red-950/85 border-red-500/40' : 'opacity-0 group-hover:opacity-100 focus-within:opacity-100 bg-ink-900/85 border-white/10'}`}>
         {isHost ? (
-          <div className="flex flex-col gap-2 mb-2 w-80">
-            <div className="flex items-center gap-2">
-              <input
-                type="text"
-                value={inputUrl}
-                onChange={(e) => setInputUrl(e.target.value)}
-                placeholder="Paste video URL (youtube.com...)"
-                className={`flex-1 bg-black/50 text-white px-3 py-1.5 rounded text-sm focus:outline-none focus:ring-1 transition-colors ${videoError ? 'border border-red-500 focus:ring-red-500 placeholder-red-300/50' : 'focus:ring-indigo-500'}`}
-              />
-              <button
-                onClick={changeVideo}
-                className="bg-indigo-600 hover:bg-indigo-700 text-white px-3 py-1.5 rounded text-sm transition-colors"
-              >
-                Change
+          <div className="flex w-80 max-w-[calc(100vw-3rem)] flex-col gap-2.5">
+            <form
+              className="flex items-center gap-2"
+              onSubmit={changeVideo}
+            >
+              <div className="relative flex-1">
+                <Link2 size={14} className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-500" />
+                <input
+                  type="text"
+                  value={inputUrl}
+                  onChange={(e) => setInputUrl(e.target.value)}
+                  placeholder="Paste a YouTube or video URL"
+                  className={`w-full rounded-lg border bg-black/40 py-2 pl-8 pr-2 text-sm text-white placeholder:text-slate-500 transition-colors focus:outline-none focus:ring-2 ${videoError ? 'border-red-500/60 focus:ring-red-500/40' : 'border-white/10 focus:border-indigo-400/60 focus:ring-indigo-500/30'}`}
+                />
+              </div>
+              <button type="submit" className="btn-primary px-3 py-2 text-xs">
+                Play
               </button>
+            </form>
+            <label className="flex cursor-pointer items-center gap-2 rounded-lg border border-dashed border-white/15 px-3 py-2 text-xs text-slate-300 transition-colors hover:border-indigo-400/50 hover:bg-white/[0.03]">
+              <FileVideo size={14} className="text-indigo-300" />
+              <span className="flex-1">Play a local video file</span>
+              <input type="file" accept="video/*" onChange={handleLocalFile} className="sr-only" />
+            </label>
+            <div className="flex items-center gap-2">
+              <label className="flex flex-1 cursor-pointer items-center gap-2 rounded-lg border border-dashed border-white/15 px-3 py-2 text-xs text-slate-300 transition-colors hover:border-indigo-400/50 hover:bg-white/[0.03]">
+                <FileText size={14} className="text-indigo-300" />
+                <span className="flex-1 truncate">{subtitles ? `Subtitles: ${subtitles.label}` : "Load subtitles (.srt / .vtt)"}</span>
+                <input type="file" accept=".srt,.vtt,text/vtt" onChange={handleSubtitleFile} className="sr-only" />
+              </label>
+              {subtitles && (
+                <>
+                  <button type="button" onClick={toggleSubtitles} className="btn-ghost p-2" title={showSubtitles ? "Hide subtitles" : "Show subtitles"} aria-label="Toggle subtitles">
+                    {showSubtitles ? <Captions size={14} /> : <CaptionsOff size={14} />}
+                  </button>
+                  <button type="button" onClick={() => socket?.emit("subtitles_clear", { roomId })} className="btn-ghost p-2 hover:text-red-300" title="Remove subtitles" aria-label="Remove subtitles">
+                    <X size={14} />
+                  </button>
+                </>
+              )}
             </div>
-            <div className="flex items-center gap-2 mt-1">
-              <span className="text-xs text-slate-400 font-medium whitespace-nowrap">LOCAL FILE:</span>
-              <input 
-                type="file" 
-                accept="video/*" 
-                onChange={handleLocalFile}
-                className="text-xs text-slate-300 file:mr-2 file:py-1 file:px-2 file:rounded file:border-0 file:text-xs file:bg-indigo-600 file:text-white hover:file:bg-indigo-500 transition-colors w-full cursor-pointer"
-              />
-            </div>
-            <div className="flex items-center gap-2 mt-2 pt-2 border-t border-slate-700/50">
+            <div className="flex items-center gap-2 border-t border-white/5 pt-2.5">
               {shareScreen && (
-                <button
-                  onClick={shareScreen}
-                  className="flex-1 bg-slate-700 hover:bg-slate-600 text-white px-3 py-1.5 rounded text-sm transition-colors flex items-center justify-center gap-2"
-                >
-                  <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect width="20" height="14" x="2" y="3" rx="2"/><line x1="8" x2="16" y1="21" y2="21"/><line x1="12" x2="12" y1="17" y2="21"/></svg>
-                  Share Screen
+                <button onClick={shareScreen} className="btn-secondary flex-1 px-3 py-2 text-xs">
+                  <MonitorUp size={14} /> Share screen
                 </button>
               )}
-              <button
-                onClick={handleStopMedia}
-                className="flex-1 bg-red-600/80 hover:bg-red-500 text-white px-3 py-1.5 rounded text-sm transition-colors flex items-center justify-center gap-2"
-              >
-                <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M9 9h6v6H9z"/></svg>
-                Stop Media
+              <button onClick={handleStopMedia} className="btn-danger flex-1 px-3 py-2 text-xs">
+                <Square size={12} /> Stop media
               </button>
             </div>
           </div>
         ) : (
-          <div className="flex justify-end w-full mb-2">
+          <div className="flex items-center gap-2">
+            {subtitleToggle}
             <button
               onClick={() => socket?.emit("request_sync", { roomId })}
-              className="bg-indigo-600 hover:bg-indigo-500 text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors shadow-lg flex items-center gap-2"
+              className="btn-primary px-4 py-2 text-sm"
             >
-              <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/><path d="M16 21v-5h5"/></svg>
-              Sync with Host
+              <RefreshCcw size={15} />
+              Sync with host
             </button>
           </div>
         )}
         {videoError && (
-          <div className="text-red-300 text-xs text-right mt-1 font-medium bg-red-950/80 p-2 rounded w-full border border-red-900/50">
-            Cannot play this URL. Make sure it's a direct video link.
+          <div className="mt-2 w-full rounded-lg border border-red-500/30 bg-red-950/80 p-2 text-right text-xs font-medium text-red-300">
+            Can't play this URL. Make sure it's a YouTube link or a direct video file.
           </div>
         )}
       </div>
 
-      <div className={`flex-1 overflow-hidden relative bg-black flex items-center justify-center transition-all duration-300 ${isFullscreen ? '' : 'rounded-2xl shadow-2xl border border-slate-800'}`}>
+      <div className={`flex-1 overflow-hidden relative bg-black flex items-center justify-center transition-all duration-300 ${isFullscreen ? '' : 'rounded-2xl shadow-2xl ring-1 ring-white/10'}`}>
         {url ? (
           <Player
             key={url}
@@ -569,15 +688,24 @@ const VideoPlayer = forwardRef<VideoPlayerRef, VideoPlayerProps>(({ roomId, isFu
             onSeek={handleSeek}
             onProgress={handleProgress}
             onError={() => setVideoError(true)}
+            onEnded={handleEnded}
+            onBuffer={handleBuffer}
+            onBufferEnd={handleBufferEnd}
             controls={true}
             config={{ youtube: { playerVars: { fs: 0 } } }}
             style={{ position: "absolute", top: 0, left: 0 }}
           />
         ) : (
-          <div className="text-slate-500 flex flex-col items-center justify-center h-full">
-            <MonitorPlay size={48} className="mb-4 opacity-20" />
-            <p>Waiting for host to play media...</p>
+          <div className="flex h-full flex-col items-center justify-center text-center text-slate-500">
+            <div className="mb-4 grid h-20 w-20 place-items-center rounded-3xl bg-white/[0.04] ring-1 ring-white/10">
+              <MonitorPlay size={36} className="text-slate-400" />
+            </div>
+            <p className="font-medium text-slate-300">{isHost ? "Nothing playing yet" : "Waiting for the host to play something"}</p>
+            <p className="mt-1 text-sm">{isHost ? "Hover here and paste a video link to get started." : "Grab a snack — it'll start for everyone at once."}</p>
           </div>
+        )}
+        {url && subtitles && showSubtitles && (
+          <SubtitleOverlay vtt={subtitles.vtt} getCurrentTime={readCurrentTime} isFullscreen={isFullscreen} />
         )}
       </div>
     </div>

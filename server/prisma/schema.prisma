@@ -14,6 +14,8 @@ model User {
   passwordHash  String
   name          String
   avatar        String?
+  avatarUpdatedAt   DateTime?
+  passwordChangedAt DateTime?
   createdAt     DateTime      @default(now())
   updatedAt     DateTime      @updatedAt
 
@@ -25,6 +27,9 @@ model User {
 
   friends       Friend[]      @relation("UserFriends")
   friendOf      Friend[]      @relation("FriendUsers")
+  queueItems    RoomQueueItem[]
+  roomBans      RoomBan[]
+  resetTokens   PasswordResetToken[]
 }
 
 model Room {
@@ -42,11 +47,51 @@ model Room {
   
   playbackUrl     String?
   playbackTime    Float?        @default(0)
+  scheduledFor    DateTime?
 
   participants    Participant[]
   coHosts         RoomCoHost[]
   messages        Message[]
   historyEntries  RoomHistoryEntry[]
+  queueItems      RoomQueueItem[]
+  bans            RoomBan[]
+}
+
+model RoomQueueItem {
+  id            String        @id @default(uuid())
+  roomId        String
+  url           String
+  addedById     String
+  position      Int
+  createdAt     DateTime      @default(now())
+
+  room          Room          @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  addedBy       User          @relation(fields: [addedById], references: [id], onDelete: Cascade)
+
+  @@index([roomId, position])
+}
+
+model RoomBan {
+  id            String        @id @default(uuid())
+  roomId        String
+  userId        String
+  createdAt     DateTime      @default(now())
+
+  room          Room          @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  user          User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([roomId, userId])
+}
+
+model PasswordResetToken {
+  id            String        @id @default(uuid())
+  userId        String
+  tokenHash     String        @unique
+  expiresAt     DateTime
+  usedAt        DateTime?
+  createdAt     DateTime      @default(now())
+
+  user          User          @relation(fields: [userId], references: [id], onDelete: Cascade)
 }
 
 model RoomCoHost {
