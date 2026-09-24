@@ -133,7 +133,10 @@ const VideoPlayer = forwardRef<VideoPlayerRef, VideoPlayerProps>(({ roomId, isFu
     const serverDelay = syncState.serverTime && syncState.lastUpdatedAt
       ? Math.max(0, (syncState.serverTime - syncState.lastUpdatedAt) / 1000)
       : 0;
-    return syncState.time + serverDelay + elapsedSinceReceipt;
+    // Run slightly ahead to cancel out this device's audio latency (e.g. Bluetooth headphones),
+    // so what the viewer *hears* lines up with everyone else.
+    const latencyCompensation = useAudioStore.getState().settings.syncOffsetMs / 1000;
+    return syncState.time + serverDelay + elapsedSinceReceipt + latencyCompensation;
   };
 
   const applyDriftCorrection = (expectedTime: number, isPlaying: boolean) => {

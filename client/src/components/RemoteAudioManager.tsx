@@ -1,5 +1,7 @@
 import React, { useEffect, useRef, useState, useCallback } from "react";
 import { VolumeX, Volume2 } from "lucide-react";
+import { useSocketStore } from "../store/useSocketStore";
+import { useAudioStore } from "../store/useAudioStore";
 
 export interface RemoteAudioSinkProps {
   peerSocketId: string;
@@ -19,6 +21,17 @@ export function RemoteAudioSink({
   unregisterAudioElement,
 }: RemoteAudioSinkProps) {
   const audioRef = useRef<HTMLAudioElement>(null);
+  // Voice volume = the "voice volume" setting (custom audio mode) × this person's own slider.
+  const peerUserId = useSocketStore((s) => s.participants[peerSocketId]?.userId);
+  const peerVolume = useAudioStore((s) => (peerUserId ? s.peerVolumes[peerUserId] ?? 1 : 1));
+  const voiceVolume = useAudioStore((s) => (s.settings.audioMode === "custom" ? s.settings.customVoiceVolume : 1));
+  const volume = Math.min(1, Math.max(0, peerVolume * voiceVolume));
+  const volumeRef = useRef(volume);
+
+  useEffect(() => {
+    volumeRef.current = volume;
+    if (audioRef.current) audioRef.current.volume = volume;
+  }, [volume]);
 
   useEffect(() => {
     const audioEl = audioRef.current;
@@ -32,7 +45,7 @@ export function RemoteAudioSink({
         audioEl.srcObject = stream;
       }
       audioEl.muted = false;
-      audioEl.volume = 1.0;
+      audioEl.volume = volumeRef.current;
 
       const playPromise = audioEl.play();
       if (playPromise !== undefined) {
@@ -135,8 +148,8 @@ export default function RemoteAudioManager({
   const unlockAllAudio = useCallback(() => {
     audioElementsMap.current.forEach((audioEl, socketId) => {
       if (audioEl) {
+        // Keep each sink's own volume; just unmute and retry playback.
         audioEl.muted = false;
-        audioEl.volume = 1.0;
         audioEl
           .play()
           .then(() => {

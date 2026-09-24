@@ -39,6 +39,24 @@ export interface SkipVotes {
 
 export type SyncState = 'synced' | 'drifting' | 'buffering' | 'error';
 
+export interface PollView {
+  id: string;
+  question: string;
+  options: string[];
+  counts: number[];
+  totalVotes: number;
+  createdByName: string;
+  queueWinner: boolean;
+  closesAt: number | null;
+  closed: boolean;
+  winner: number | null;
+}
+
+export interface ChatSettings {
+  slowModeSeconds: number;
+  muted: { userId: string; until: number | null }[];
+}
+
 export interface RecentlyPlayed {
   url: string;
   playedAt: number;
@@ -120,6 +138,9 @@ interface SocketState {
   /** Local clock time the countdown ends, or null. */
   countdownEndsAt: number | null;
   unreadMentions: number;
+  poll: PollView | null;
+  myPollVote: number | null;
+  chatSettings: ChatSettings;
   currentRoomSession: RoomSession | null;
   connect: () => void;
   disconnect: () => void;
@@ -171,6 +192,9 @@ export const useSocketStore = create<SocketState>((set, get) => ({
   recentlyPlayed: [],
   countdownEndsAt: null,
   unreadMentions: 0,
+  poll: null,
+  myPollVote: null,
+  chatSettings: { slowModeSeconds: 0, muted: [] },
   currentRoomSession: null,
 
   connect: () => {
@@ -260,6 +284,18 @@ export const useSocketStore = create<SocketState>((set, get) => ({
       socket.on('user_joined', ({ socketId, userId, userName, avatarVersion }: Participant) => {
         rememberAvatars({ [userId]: avatarVersion });
         set((state) => ({ participants: { ...state.participants, [socketId]: { socketId, userId, userName, avatarVersion } } }));
+      });
+
+      socket.on('poll_updated', (poll: PollView | null) => {
+        set({ poll });
+      });
+
+      socket.on('poll_my_vote', (myPollVote: number | null) => {
+        set({ myPollVote });
+      });
+
+      socket.on('chat_settings', (chatSettings: ChatSettings) => {
+        set({ chatSettings });
       });
 
       socket.on('message_deleted', ({ id }: { id: string }) => {
@@ -367,7 +403,9 @@ export const useSocketStore = create<SocketState>((set, get) => ({
           errorMsg.includes("too quickly") ||
           errorMsg.includes("Nothing is queued") ||
           errorMsg.includes("Subtitle file") ||
-          errorMsg.includes("countdown")
+          errorMsg.includes("countdown") ||
+          errorMsg.includes("poll") ||
+          errorMsg.includes("mute a co-host")
         ) {
           toast.error(errorMsg);
         } else if (errorMsg.includes("Too many password attempts")) {
@@ -378,7 +416,8 @@ export const useSocketStore = create<SocketState>((set, get) => ({
           set({ roomAccessError: 'password_required' });
         } else if (
           errorMsg.includes("Unauthorized userId mismatch") ||
-          errorMsg.includes("Room not found")
+          errorMsg.includes("Room not found") ||
+          errorMsg.includes("live on another server")
         ) {
           set({ reconnectError: errorMsg });
         }
@@ -412,7 +451,7 @@ export const useSocketStore = create<SocketState>((set, get) => ({
   },
 
   leaveRoom: (roomId, userId, userName) => {
-    set({ currentRoomSession: null, reconnectError: null, roomAccessError: null, participants: {}, reactions: [], queue: [], typingUsers: {}, roomInfo: null, subtitles: null, skipVotes: { count: 0, needed: 1, voters: [] }, viewerSync: {}, recentlyPlayed: [], countdownEndsAt: null, unreadMentions: 0 });
+    set({ currentRoomSession: null, reconnectError: null, roomAccessError: null, participants: {}, reactions: [], queue: [], typingUsers: {}, roomInfo: null, subtitles: null, skipVotes: { count: 0, needed: 1, voters: [] }, viewerSync: {}, recentlyPlayed: [], countdownEndsAt: null, unreadMentions: 0, poll: null, myPollVote: null, chatSettings: { slowModeSeconds: 0, muted: [] } });
     const { socket } = get();
     if (socket) {
       socket.emit('leave_room', { roomId, userId, userName });

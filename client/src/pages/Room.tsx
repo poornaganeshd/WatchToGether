@@ -18,6 +18,7 @@ import ChatPanel from "../components/ChatPanel";
 import PasswordPrompt from "../components/PasswordPrompt";
 import { ReactionOverlay, ReactionPicker } from "../components/Reactions";
 import CountdownOverlay from "../components/CountdownOverlay";
+import CameraPopout from "../components/CameraPopout";
 import { toast } from "../store/useToastStore";
 import { loadIceServers } from "../lib/ice";
 import { copyToClipboard, formatClock } from "../lib/format";
@@ -170,7 +171,7 @@ export default function Room() {
         // Don't leave the room password sitting in browser history state.
         navigate(location.pathname, { replace: true, state: null });
       }
-      if (room.isPrivate && room.hasPassword !== false && !isPrivileged && !passwordFromDashboard) {
+      if (room.isPrivate && room.hasPassword !== false && !isPrivileged && !room.canSkipPassword && !passwordFromDashboard) {
         setPasswordPrompt({ open: true, error: null });
         return;
       }
@@ -681,6 +682,11 @@ export default function Room() {
               >
                 <Share2 size={18} />
               </button>
+              <CameraPopout
+                localStream={localStreamState || localStream.current}
+                peers={peers}
+                className="grid h-11 w-11 place-items-center rounded-xl border border-white/10 bg-ink-900/80 text-slate-200 shadow-lg backdrop-blur transition-colors hover:bg-indigo-500/30 hover:text-white aria-pressed:bg-indigo-500/40"
+              />
               {id && <ReactionPicker roomId={id} />}
 
               <button 
@@ -808,7 +814,7 @@ export default function Room() {
           ))}
         </dl>
       </Modal>
-      {id && <InviteModal isOpen={isInviteModalOpen} onClose={() => setIsInviteModalOpen(false)} roomId={id} roomCode={roomDisplayId} />}
+      {id && <InviteModal isOpen={isInviteModalOpen} onClose={() => setIsInviteModalOpen(false)} roomId={id} roomCode={roomDisplayId} canManage={isHost} />}
       <PasswordPrompt
         key={passwordPrompt.error ?? "prompt"}
         isOpen={passwordPrompt.open}

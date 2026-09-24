@@ -317,6 +317,8 @@ export const resetPassword = async (req: Request, res: Response): Promise<void> 
     ]);
     invalidateAuthCache(record.userId);
     disconnectUserSockets(req.app.get("io"), record.userId);
+    // A reset may mean the account was compromised: stop pushing to devices it was signed in on.
+    await prisma.pushSubscription.deleteMany({ where: { userId: record.userId } });
 
     res.status(200).json({ message: "Password reset. You can sign in now." });
   } catch (error) {

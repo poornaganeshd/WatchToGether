@@ -1,6 +1,9 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { ArrowDown, ChevronDown, ChevronRight, ChevronUp, Clock, Crown, History, ListPlus, ListVideo, MessageSquare, Mic2, Play, Plus, SendHorizonal, Settings, Share2, Shield, ShieldOff, SkipForward, Trash2, Users, UserX, X } from "lucide-react";
 import { mentionsUser, useSocketStore, type Message, type QueueItem } from "../store/useSocketStore";
+import { useAudioStore } from "../store/useAudioStore";
+import { PollCard, PollComposer } from "./Polls";
+import { BarChart3, MicOff, Timer, Volume2, VolumeX } from "lucide-react";
 import { timeAgo } from "../lib/format";
 import Avatar from "./ui/Avatar";
 
@@ -58,6 +61,21 @@ export default function ChatPanel({
   const viewerSync = useSocketStore((s) => s.viewerSync);
   const recentlyPlayed = useSocketStore((s) => s.recentlyPlayed);
   const [mentionIndex, setMentionIndex] = useState(0);
+  const poll = useSocketStore((s) => s.poll);
+  const chatSettings = useSocketStore((s) => s.chatSettings);
+  const peerVolumes = useAudioStore((s) => s.peerVolumes);
+  const setPeerVolume = useAudioStore((s) => s.setPeerVolume);
+  const [composerOpen, setComposerOpen] = useState(false);
+  const [volumeFor, setVolumeFor] = useState<string | null>(null);
+  const [now, setNow] = useState(() => Date.now());
+  // Timed mutes lapse on their own; tick so the UI notices without a server update.
+  useEffect(() => {
+    if (!chatSettings.muted.some((m) => m.until !== null)) return;
+    const id = setInterval(() => setNow(Date.now()), 5000);
+    return () => clearInterval(id);
+  }, [chatSettings.muted]);
+  const muteOf = (uid: string) => chatSettings.muted.find((m) => m.userId === uid && (m.until === null || m.until > now));
+  const myMute = muteOf(currentUser.id) ?? null;
   const socket = useSocketStore((s) => s.socket);
   const [tab, setTab] = useState<"chat" | "queue" | "people">("chat");
   const [queueUrl, setQueueUrl] = useState("");
@@ -276,11 +294,36 @@ export default function ChatPanel({
             <Mic2 size={13} className={hostAnnouncementActive ? "animate-pulse" : ""} />
             {hostAnnouncementActive ? "Stop announcement" : "Host announcement"}
           </button>
+          <div className="mt-2 flex items-center gap-2">
+            <button
+              onClick={() => setComposerOpen(true)}
+              disabled={!!poll && !poll.closed}
+              className="flex flex-1 items-center justify-center gap-1.5 rounded-lg border border-white/10 bg-white/[0.03] py-1.5 text-xs font-semibold text-slate-300 transition-colors hover:bg-white/[0.07] disabled:opacity-40"
+              title={poll && !poll.closed ? "Close the current poll first" : "Start a poll"}
+            >
+              <BarChart3 size={13} /> New poll
+            </button>
+            <label className="flex flex-1 items-center gap-1.5 rounded-lg border border-white/10 bg-white/[0.03] px-2 py-1 text-xs text-slate-300">
+              <Timer size={13} className={chatSettings.slowModeSeconds ? "text-amber-300" : "text-slate-400"} />
+              <select
+                value={chatSettings.slowModeSeconds}
+                onChange={(e) => socket?.emit("set_slow_mode", { roomId, seconds: Number(e.target.value) })}
+                className="min-w-0 flex-1 bg-transparent py-0.5 text-xs font-semibold focus:outline-none"
+                aria-label="Slow mode"
+              >
+                {[0, 5, 10, 30, 60].map((sec) => (
+                  <option key={sec} value={sec} className="bg-ink-900">{sec ? `Slow mode ${sec}s` : "Slow mode off"}</option>
+                ))}
+              </select>
+            </label>
+          </div>
         </div>
       )}
+      <PollComposer roomId={roomId} isOpen={composerOpen} onClose={() => setComposerOpen(false)} />
 
       {tab === "chat" ? (
         <>
+          <PollCard roomId={roomId} canManage={isHost} />
           <div className="relative flex-1 overflow-hidden">
             <div ref={listRef} onScroll={handleScroll} className="h-full overflow-y-auto px-3 py-4">
               {messages.length === 0 ? (
@@ -334,6 +377,16 @@ export default function ChatPanel({
             </div>
           )}
 
+          {(myMute || chatSettings.slowModeSeconds > 0) && (
+            <div className={`mx-3 mb-1 flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-[11px] ${myMute ? "bg-red-500/10 text-red-300" : "bg-amber-400/10 text-amber-200"}`}>
+              {myMute ? <MicOff size={12} /> : <Timer size={12} />}
+              {myMute
+                ? myMute.until
+                  ? `You're muted until ${new Date(myMute.until).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}`
+                  : "You've been muted by the host"
+                : `Slow mode: one message every ${chatSettings.slowModeSeconds}s${isHost ? " (hosts are exempt)" : ""}`}
+            </div>
+          )}
           <form onSubmit={handleSend} className="relative flex items-center gap-2 border-t border-white/5 p-3">
             {mentionSuggestions.length > 0 && (
               <div className="absolute bottom-full left-3 right-3 mb-1 overflow-hidden rounded-xl border border-white/10 bg-ink-850/95 shadow-2xl backdrop-blur-xl animate-fade-up" role="listbox" aria-label="Mention someone">
@@ -366,7 +419,8 @@ export default function ChatPanel({
                 }}
                 onKeyDown={handleInputKeyDown}
                 onBlur={stopTyping}
-                placeholder="Send a message"
+                disabled={!!myMute}
+                placeholder={myMute ? "You're muted" : "Send a message"}
                 className="min-w-0 flex-1 bg-transparent px-3 py-2.5 text-sm text-slate-100 placeholder:text-slate-500 focus:outline-none"
               />
               <button
@@ -501,8 +555,13 @@ export default function ChatPanel({
           {people.map((p) => {
             const isRoomHost = p.userId === hostId;
             const isCo = coHostIds.includes(p.userId);
+            const isMe = p.userId === currentUser.id;
+            const mute = muteOf(p.userId);
+            const volume = peerVolumes[p.userId] ?? 1;
+            const canMute = isHost && !isRoomHost && !isMe && (!isCo || hostId === currentUser.id);
             return (
-              <div key={p.socketId} className="group flex items-center gap-3 rounded-xl p-2 hover:bg-white/[0.03]">
+              <div key={p.socketId} className="rounded-xl hover:bg-white/[0.03]">
+              <div className="group flex items-center gap-3 p-2">
                 <Avatar name={p.userName} seed={p.userId} size={34} />
                 <div className="min-w-0 flex-1">
                   <p className="truncate text-sm font-medium text-slate-100">
@@ -511,6 +570,7 @@ export default function ChatPanel({
                   </p>
                   <p className="flex items-center gap-1.5 text-xs text-slate-500">
                     {isRoomHost ? "Host" : isCo ? "Co-host" : "Viewer"}
+                    {mute && <span className="inline-flex items-center gap-0.5 text-red-300">· <MicOff size={10} /> muted</span>}
                     {!isRoomHost && <SyncBadge report={viewerSync[p.socketId]} />}
                   </p>
                 </div>
@@ -529,6 +589,36 @@ export default function ChatPanel({
                     <ShieldOff size={14} />
                   </button>
                 )}
+                {!isMe && (
+                  <button
+                    onClick={() => setVolumeFor((v) => (v === p.socketId ? null : p.socketId))}
+                    className={`btn-ghost p-1.5 transition-opacity group-hover:opacity-100 ${volume < 1 ? "text-amber-300 opacity-100" : "opacity-60"}`}
+                    title={`Their voice volume: ${Math.round(volume * 100)}%`}
+                    aria-label={`Adjust ${p.userName}'s volume`}
+                    aria-expanded={volumeFor === p.socketId}
+                  >
+                    {volume === 0 ? <VolumeX size={14} /> : <Volume2 size={14} />}
+                  </button>
+                )}
+                {canMute && (
+                  <select
+                    value=""
+                    onChange={(e) => {
+                      const v = e.target.value;
+                      socket?.emit("mute_user", { roomId, targetUserId: p.userId, minutes: v === "forever" ? null : Number(v) });
+                    }}
+                    className="w-7 cursor-pointer appearance-none rounded-md bg-transparent p-1.5 text-center text-xs text-slate-400 opacity-60 hover:bg-white/5 hover:text-white group-hover:opacity-100"
+                    title={mute ? "Unmute or change mute" : "Mute in chat"}
+                    aria-label={`Chat mute options for ${p.userName}`}
+                  >
+                    <option value="" disabled className="bg-ink-900">{mute ? "🔇" : "💬"}</option>
+                    {mute && <option value="0" className="bg-ink-900">Unmute</option>}
+                    <option value="5" className="bg-ink-900">Mute 5 min</option>
+                    <option value="15" className="bg-ink-900">Mute 15 min</option>
+                    <option value="60" className="bg-ink-900">Mute 1 hour</option>
+                    <option value="forever" className="bg-ink-900">Mute until unmuted</option>
+                  </select>
+                )}
                 {isHost && !isRoomHost && p.userId !== currentUser.id && (
                   <div className="flex items-center opacity-60 transition-opacity group-hover:opacity-100">
                     {hostId === currentUser.id && !isCo && (
@@ -543,6 +633,22 @@ export default function ChatPanel({
                     )}
                   </div>
                 )}
+              </div>
+              {volumeFor === p.socketId && (
+                <div className="flex items-center gap-3 px-3 pb-2 animate-fade-up">
+                  <VolumeX size={13} className="shrink-0 text-slate-500" />
+                  <input
+                    type="range"
+                    min={0}
+                    max={100}
+                    value={Math.round(volume * 100)}
+                    onChange={(e) => setPeerVolume(p.userId, Number(e.target.value) / 100)}
+                    className="flex-1 accent-indigo-500"
+                    aria-label={`${p.userName}'s volume`}
+                  />
+                  <span className="w-9 text-right font-mono text-[11px] text-slate-400">{Math.round(volume * 100)}%</span>
+                </div>
+              )}
               </div>
             );
           })}

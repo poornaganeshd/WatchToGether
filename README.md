@@ -30,6 +30,15 @@ Watch videos in sync with friends, with video/voice chat, live chat and emoji re
 - Synced countdown start (3/5/10s) that pauses everyone and starts playback together
 - Chat moderation (delete messages, demote co-hosts), @mentions with autocomplete, highlight and a notification chime
 - Recently played list with one-click re-queue
+- Chat replays: rewatch a video with the room's chat appearing when it was sent, plus a chat-activity strip
+- Pop-out cameras (Document Picture-in-Picture, with single-video PiP fallback)
+- Audio delay compensation for Bluetooth headphones, and per-person voice volume
+- Polls, including "what's next?" polls that queue the winning video
+- Expiring / limited-use invite links that skip the room password
+- Chat mute (timed or indefinite) and slow mode for hosts
+- Friend groups with one-click group invites
+- Web push notifications when the site is closed (opt-in per browser)
+- Multiple API instances behind a load balancer via Redis
 
 ## Getting started
 
@@ -67,6 +76,8 @@ npm run dev                     # http://localhost:5173
 | `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`, `SMTP_FROM` | Email invitations and password reset. Without SMTP, reset links are printed to the server log in development |
 | `TURN_URLS`, `TURN_SECRET` | TURN relay for WebRTC. With a shared secret (coturn `use-auth-secret`) the API hands out 12-hour credentials. `TURN_USERNAME`/`TURN_CREDENTIAL` work for static credentials |
 | `TRUST_PROXY` | Set (e.g. `1`) behind a reverse proxy so rate limits see real client IPs |
+| `REDIS_URL` | Redis 7+ for running several API instances (shared broadcasts, presence, rate limits, room ownership) |
+| `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY`, `VAPID_SUBJECT` | Web push. Generate keys with `npx web-push generate-vapid-keys` |
 
 ### TURN relay
 
@@ -77,13 +88,19 @@ TURN_SECRET=$(openssl rand -hex 32) EXTERNAL_IP=<public ip> docker compose --pro
 # API: TURN_URLS=turn:<public host>:3478 TURN_SECRET=<same secret>
 ```
 
+### Running several API instances
+
+Set the same `REDIS_URL` on every instance. Socket.IO broadcasts, presence, rate limits, forced sign-outs and notifications are then shared.
+
+Live room state (playback, participants, queue order, polls) stays in the memory of whichever instance first opened the room; a Redis lease records the owner, and another instance refuses to open a second copy (people see "This room is live on another server" with a retry). For everyone to reach the owning instance, route by room at the load balancer (for example, sticky sessions keyed on the room id) or run a single instance for rooms. Moving room state itself into Redis would remove that constraint and is the natural next step if you outgrow one room server.
+
 ## Tests
 
 The server suites spin up a real Socket.IO server against the configured database:
 
 ```bash
 cd server
-npm test
+npm test   # set REDIS_URL too to include the two-instance test
 ```
 
 Client checks: `npm run lint` and `npm run build` in `client/`.

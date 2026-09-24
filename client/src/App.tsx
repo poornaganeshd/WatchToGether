@@ -9,6 +9,8 @@ import NotFound from "./pages/NotFound";
 import ForgotPassword from "./pages/ForgotPassword";
 import ResetPassword from "./pages/ResetPassword";
 import Settings from "./pages/Settings";
+import InviteAccept from "./pages/InviteAccept";
+import Replay from "./pages/Replay";
 import { rememberAvatars } from "./store/useAvatarStore";
 import Toaster from "./components/ui/Toaster";
 import { useAuthStore } from "./store/useAuthStore";
@@ -80,6 +82,8 @@ function App() {
           <Route path="/settings" element={<RequireAuth><Settings /></RequireAuth>} />
           <Route path="/dashboard" element={<RequireAuth><Dashboard /></RequireAuth>} />
           <Route path="/room/:id" element={<RequireAuth><Room /></RequireAuth>} />
+          <Route path="/room/:id/replay" element={<RequireAuth><Replay /></RequireAuth>} />
+          <Route path="/invite/:token" element={<RequireAuth><InviteAccept /></RequireAuth>} />
           <Route path="*" element={<NotFound />} />
         </Routes>
       </div>

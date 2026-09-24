@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import {
-  CalendarClock, CalendarPlus, Check, Copy, Crown, Settings as SettingsIcon, Globe2, History, KeyRound, Lock, LogIn, LogOut, MonitorPlay, Plus, RefreshCw, Search,
+  CalendarClock, CalendarPlus, Check, Clapperboard, Copy, Crown, Settings as SettingsIcon, Globe2, History, KeyRound, Lock, LogIn, LogOut, MonitorPlay, Plus, RefreshCw, Search,
   Trash2, UserMinus, UserPlus, Users, X,
 } from "lucide-react";
 import api, { getErrorMessage } from "../lib/api";
@@ -13,6 +13,8 @@ import Logo from "../components/ui/Logo";
 import Avatar from "../components/ui/Avatar";
 import Spinner from "../components/ui/Spinner";
 import PasswordInput from "../components/PasswordInput";
+import FriendGroups from "../components/FriendGroups";
+import { signOut } from "../lib/session";
 import { rememberAvatars } from "../store/useAvatarStore";
 import { countdown, downloadCalendarEvent, toLocalInputValue } from "../lib/calendar";
 
@@ -44,7 +46,7 @@ interface RoomSummary {
 type Tab = "live" | "upcoming" | "friends" | "history";
 
 export default function Dashboard() {
-  const { user, logout } = useAuthStore();
+  const { user } = useAuthStore();
   const { socket, connect } = useSocketStore();
   const navigate = useNavigate();
 
@@ -382,7 +384,7 @@ export default function Dashboard() {
             <Link to="/settings" className="btn-ghost px-2.5" title="Settings" aria-label="Settings">
               <SettingsIcon size={18} />
             </Link>
-            <button onClick={logout} className="btn-ghost px-2.5" title="Sign out" aria-label="Sign out">
+            <button onClick={() => signOut()} className="btn-ghost px-2.5" title="Sign out" aria-label="Sign out">
               <LogOut size={18} />
             </button>
           </div>
@@ -601,6 +603,7 @@ export default function Dashboard() {
 
         {activeTab === "friends" && (
           <section className="grid gap-4 animate-fade-in lg:grid-cols-3">
+            <div className="space-y-4">
             <form onSubmit={handleSendFriendRequest} className="card h-fit p-5">
               <h3 className="font-display font-semibold">Add a friend</h3>
               <p className="mb-4 mt-1 text-xs text-slate-400">Send a request using their account email.</p>
@@ -615,6 +618,8 @@ export default function Dashboard() {
                 {isSendingRequest ? <Spinner className="h-4 w-4" /> : <UserPlus size={16} />} Send request
               </button>
             </form>
+            <FriendGroups friends={acceptedFriends.map((f) => ({ id: f.user.id, name: f.user.name, avatarVersion: f.user.avatarVersion }))} />
+            </div>
 
             <div className="space-y-4 lg:col-span-2">
               {incomingRequests.length > 0 && (
@@ -786,6 +791,9 @@ export default function Dashboard() {
                       <div className="flex shrink-0 items-center gap-2">
                         <button onClick={() => navigate(`/room/${room.id}`)} className="btn-primary px-4 py-2 text-xs">
                           {isLive ? "Join" : "Open"}
+                        </button>
+                        <button onClick={() => navigate(`/room/${room.id}/replay`)} className="btn-ghost px-2 py-2" title="Chat replays" aria-label="Chat replays">
+                          <Clapperboard size={16} />
                         </button>
                         {isHost && isLive && (
                           <button onClick={() => handleEndRoom(room.id)} className="btn-danger px-3 py-2 text-xs">
