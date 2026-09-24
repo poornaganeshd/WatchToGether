@@ -12,12 +12,15 @@ export interface VideoPlayerRef {
 interface VideoPlayerProps {
   roomId: string;
   isFullscreen?: boolean;
+  /** Host or co-host: may control playback for everyone. */
   isHost: boolean;
+  /** The single room host, whose player is the room's clock. */
+  isRoomHost?: boolean;
   broadcastMediaStream?: (stream: MediaStream) => void;
   shareScreen?: () => void;
 }
 
-const VideoPlayer = forwardRef<VideoPlayerRef, VideoPlayerProps>(({ roomId, isFullscreen = false, isHost, broadcastMediaStream, shareScreen }, ref) => {
+const VideoPlayer = forwardRef<VideoPlayerRef, VideoPlayerProps>(({ roomId, isFullscreen = false, isHost, isRoomHost = false, broadcastMediaStream, shareScreen }, ref) => {
   const { socket } = useSocketStore();
   const [url, setUrl] = useState("https://www.youtube.com/watch?v=aqz-KE-bpKQ");
   const [inputUrl, setInputUrl] = useState("");
@@ -29,6 +32,10 @@ const VideoPlayer = forwardRef<VideoPlayerRef, VideoPlayerProps>(({ roomId, isFu
   const isHandlingRemote = useRef(false);
   const isHostRef = useRef(isHost);
   isHostRef.current = isHost;
+  const isRoomHostRef = useRef(isRoomHost);
+  isRoomHostRef.current = isRoomHost;
+  // The host applies the server's saved state once when (re)joining, then acts as the clock.
+  const hostInitializedRef = useRef(false);
   const isFullscreenRef = useRef(isFullscreen);
   isFullscreenRef.current = isFullscreen;
   const urlRef = useRef(url);
@@ -230,7 +237,6 @@ const VideoPlayer = forwardRef<VideoPlayerRef, VideoPlayerProps>(({ roomId, isFu
     if (!socket) return;
 
     const handlePlayVideo = ({ time, serverTime }: { time: number; serverTime?: number }) => {
-      if (isHostRef.current) return;
       if (pendingUrlRef.current && pendingUrlRef.current !== urlRef.current) return;
       markHandlingRemote(800);
       lastSyncStateRef.current = {
@@ -251,7 +257,6 @@ const VideoPlayer = forwardRef<VideoPlayerRef, VideoPlayerProps>(({ roomId, isFu
     };
 
     const handlePauseVideo = ({ time, serverTime }: { time: number; serverTime?: number }) => {
-      if (isHostRef.current) return;
       if (pendingUrlRef.current && pendingUrlRef.current !== urlRef.current) return;
       markHandlingRemote(800);
       lastSyncStateRef.current = {
@@ -269,7 +274,6 @@ const VideoPlayer = forwardRef<VideoPlayerRef, VideoPlayerProps>(({ roomId, isFu
     };
 
     const handleSeekVideo = ({ time, serverTime }: { time: number; serverTime?: number }) => {
-      if (isHostRef.current) return;
       if (pendingUrlRef.current && pendingUrlRef.current !== urlRef.current) return;
       markHandlingRemote(800);
       if (lastSyncStateRef.current) {
@@ -290,7 +294,7 @@ const VideoPlayer = forwardRef<VideoPlayerRef, VideoPlayerProps>(({ roomId, isFu
       }
       pendingUrlRef.current = null;
       setUrl(newUrl);
-      setPlaying(true);
+      setPlaying(!!newUrl);
       if (playerRef.current) {
         if (typeof playerRef.current.seekTo === 'function') playerRef.current.seekTo(0);
       }
@@ -299,7 +303,10 @@ const VideoPlayer = forwardRef<VideoPlayerRef, VideoPlayerProps>(({ roomId, isFu
 
     const handleSyncResponse = (playbackState: { time: number; playing: boolean; url: string; lastUpdatedAt?: number; serverTime?: number } | null) => {
       if (!playbackState) return;
-      if (isHostRef.current) return;
+      if (isRoomHostRef.current) {
+        if (hostInitializedRef.current) return;
+        hostInitializedRef.current = true;
+      }
 
       const { time, playing: hostPlaying, url: hostUrl, lastUpdatedAt, serverTime } = playbackState;
       markHandlingRemote(800);
@@ -350,9 +357,10 @@ const VideoPlayer = forwardRef<VideoPlayerRef, VideoPlayerProps>(({ roomId, isFu
     };
   }, [socket, roomId]);
 
-  // Host periodic heartbeat while playing
+  // Room-host heartbeat while playing. Co-hosts can control playback but follow the host's clock,
+  // otherwise two heartbeats fight each other.
   useEffect(() => {
-    if (!isHost || !playing || !socket) return;
+    if (!isRoomHost || !playing || !socket) return;
 
     const intervalId = setInterval(() => {
       if (playerRef.current && typeof playerRef.current.getCurrentTime === 'function') {
@@ -362,11 +370,11 @@ const VideoPlayer = forwardRef<VideoPlayerRef, VideoPlayerProps>(({ roomId, isFu
     }, 3000);
 
     return () => clearInterval(intervalId);
-  }, [isHost, playing, socket, roomId]);
+  }, [isRoomHost, playing, socket, roomId]);
 
-  // Non-host fallback polling if no heartbeat received for > 8s
+  // Fallback polling for everyone but the clock if no heartbeat received for > 8s
   useEffect(() => {
-    if (isHost || !socket) return;
+    if (isRoomHost || !socket) return;
     const intervalId = setInterval(() => {
       const lastReceived = lastSyncStateRef.current?.localReceiptTime || 0;
       if (Date.now() - lastReceived > 8000) {
@@ -374,13 +382,22 @@ const VideoPlayer = forwardRef<VideoPlayerRef, VideoPlayerProps>(({ roomId, isFu
       }
     }, 5000);
     return () => clearInterval(intervalId);
-  }, [isHost, socket, roomId]);
+  }, [isRoomHost, socket, roomId]);
+
+  // Viewers can't change playback: snap the player back to the room's state. Toggling the prop
+  // away and back forces ReactPlayer to re-apply it even though React state didn't change.
+  const revertToRoomState = () => {
+    const roomPlaying = lastSyncStateRef.current?.playing ?? false;
+    setPlaying(!roomPlaying);
+    setTimeout(() => setPlaying(roomPlaying), 10);
+    socket?.emit("request_sync", { roomId });
+  };
 
   const handlePlay = () => {
     if (isHandlingRemote.current) return;
     if (!isHost) {
-      setPlaying(false); // Instantly revert if not host
-      setTimeout(() => setPlaying(true), 10); // Force re-render just in case
+      // Starting playback is fine if the room is playing (e.g. after an autoplay block).
+      if (!lastSyncStateRef.current?.playing) revertToRoomState();
       return;
     }
     setPlaying(true);
@@ -391,8 +408,7 @@ const VideoPlayer = forwardRef<VideoPlayerRef, VideoPlayerProps>(({ roomId, isFu
   const handlePause = () => {
     if (isHandlingRemote.current) return;
     if (!isHost) {
-      setPlaying(true); // Instantly revert if not host
-      setTimeout(() => setPlaying(false), 10);
+      if (lastSyncStateRef.current?.playing) revertToRoomState();
       return;
     }
     setPlaying(false);
@@ -402,12 +418,15 @@ const VideoPlayer = forwardRef<VideoPlayerRef, VideoPlayerProps>(({ roomId, isFu
 
   const handleSeek = (seconds: number) => {
     if (isHandlingRemote.current) return;
-    if (!isHostRef.current) return;
+    if (!isHostRef.current) {
+      socket?.emit("request_sync", { roomId });
+      return;
+    }
     socket?.emit("seek_video", { roomId, time: seconds });
   };
 
   const handleProgress = (state: { playedSeconds: number }) => {
-    if (isHostRef.current) return;
+    if (isRoomHostRef.current) return;
     if (!lastSyncStateRef.current || !lastSyncStateRef.current.playing) return;
     if (isHandlingRemote.current) return;
 
@@ -428,7 +447,9 @@ const VideoPlayer = forwardRef<VideoPlayerRef, VideoPlayerProps>(({ roomId, isFu
     }
   };
 
-  const [videoError, setVideoError] = useState(false);
+  const [erroredUrl, setErroredUrl] = useState<string | null>(null);
+  const videoError = !!url && erroredUrl === url;
+  const setVideoError = (failed: boolean) => setErroredUrl(failed ? urlRef.current : null);
 
   const changeVideo = (e: React.FormEvent) => {
     e.preventDefault();
@@ -444,6 +465,13 @@ const VideoPlayer = forwardRef<VideoPlayerRef, VideoPlayerProps>(({ roomId, isFu
       socket?.emit("change_video", { roomId, url: finalUrl });
       socket?.emit("play_video", { roomId, time: 0 });
       setInputUrl("");
+    }
+  };
+
+  const handleEnded = () => {
+    // The room host's player drives auto-advance through the watch queue.
+    if (isRoomHostRef.current) {
+      socket?.emit("queue_next", { roomId });
     }
   };
 
@@ -558,6 +586,7 @@ const VideoPlayer = forwardRef<VideoPlayerRef, VideoPlayerProps>(({ roomId, isFu
             onSeek={handleSeek}
             onProgress={handleProgress}
             onError={() => setVideoError(true)}
+            onEnded={handleEnded}
             controls={true}
             config={{ youtube: { playerVars: { fs: 0 } } }}
             style={{ position: "absolute", top: 0, left: 0 }}

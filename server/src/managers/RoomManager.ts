@@ -11,6 +11,15 @@ export interface PlaybackState {
   serverTime?: number;
 }
 
+export interface QueueItem {
+  id: string;
+  url: string;
+  addedBy: string;
+  addedByName: string;
+}
+
+const MAX_QUEUE_LENGTH = 50;
+
 interface RoomState {
   roomId: string;
   hostId: string;
@@ -20,6 +29,10 @@ interface RoomState {
   participantStatuses: Map<string, { cam: boolean; mic: boolean }>;
   playback: PlaybackState;
   disconnectedParticipants: Map<string, { userId: string; timeout: NodeJS.Timeout }>;
+  queue: QueueItem[];
+  bannedUserIds: Set<string>;
+  maxParticipants: number;
+  startedAt: number;
 }
 
 export class RoomManager {
@@ -63,6 +76,10 @@ export class RoomManager {
           participantNames: new Map(),
           participantStatuses: new Map(),
           disconnectedParticipants: new Map(),
+          queue: [],
+          bannedUserIds: new Set(),
+          maxParticipants: dbRoom.maxParticipants ?? 10,
+          startedAt: Date.now(),
           playback: {
             playing: false,
             time: dbRoom.playbackTime ?? 0,
@@ -140,6 +157,9 @@ export class RoomManager {
       this.io.to(roomId).emit("user_left", { userId, socketId: staleId });
     }
 
+    if (room.participants.size === 0 && room.disconnectedParticipants.size === 0) {
+      room.startedAt = Date.now();
+    }
     room.participants.set(socketId, userId);
     room.participantNames.set(socketId, userName);
 
@@ -277,7 +297,7 @@ export class RoomManager {
               data: {
                 isActive: false,
                 playbackUrl: room.playback.url,
-                playbackTime: room.playback.time,
+                playbackTime: this.getCurrentPlaybackTime(room.playback),
               },
             }),
             prisma.participant.deleteMany({
@@ -387,6 +407,94 @@ export class RoomManager {
 
       this.io.to(roomId).emit("new_host", { userId: newHostId });
     }
+  }
+
+  // playback.time is the position at lastUpdatedAt; extrapolate while playing.
+  public getCurrentPlaybackTime(playback: PlaybackState): number {
+    if (!playback.playing) return playback.time;
+    return playback.time + Math.max(0, (Date.now() - playback.lastUpdatedAt) / 1000);
+  }
+
+  public isBanned(roomId: string, userId: string): boolean {
+    return !!this.rooms.get(roomId)?.bannedUserIds.has(userId);
+  }
+
+  // Distinct users currently in the room, not counting the one asking to join.
+  public isFull(roomId: string, joiningUserId: string): boolean {
+    const room = this.rooms.get(roomId);
+    if (!room) return false;
+    const others = new Set(Array.from(room.participants.values()).filter((uid) => uid !== joiningUserId));
+    for (const { userId } of room.disconnectedParticipants.values()) {
+      if (userId !== joiningUserId) others.add(userId);
+    }
+    return others.size >= room.maxParticipants;
+  }
+
+  public async kickUser(roomId: string, targetUserId: string) {
+    const room = this.rooms.get(roomId);
+    if (!room) return [];
+    room.bannedUserIds.add(targetUserId);
+    room.coHosts.delete(targetUserId);
+
+    const socketIds = Array.from(room.participants.entries())
+      .filter(([, uid]) => uid === targetUserId)
+      .map(([sid]) => sid);
+    for (const [discSocketId, data] of room.disconnectedParticipants.entries()) {
+      if (data.userId === targetUserId) {
+        clearTimeout(data.timeout);
+        room.disconnectedParticipants.delete(discSocketId);
+      }
+    }
+    for (const sid of socketIds) {
+      room.participants.delete(sid);
+      room.participantNames.delete(sid);
+      room.participantStatuses.delete(sid);
+    }
+    for (const sid of socketIds) {
+      await this.permanentlyRemoveUser(roomId, targetUserId, sid);
+    }
+    try {
+      await prisma.roomCoHost.deleteMany({ where: { roomId, userId: targetUserId } });
+    } catch (err) {
+      console.error("Failed to remove kicked co-host from DB", err);
+    }
+    return socketIds;
+  }
+
+  public updateSettings(roomId: string, update: { maxParticipants?: number }) {
+    const room = this.rooms.get(roomId);
+    if (room && update.maxParticipants !== undefined) {
+      room.maxParticipants = update.maxParticipants;
+    }
+  }
+
+  public getQueue(roomId: string): QueueItem[] {
+    return this.rooms.get(roomId)?.queue ?? [];
+  }
+
+  public addToQueue(roomId: string, item: QueueItem): boolean {
+    const room = this.rooms.get(roomId);
+    if (!room || room.queue.length >= MAX_QUEUE_LENGTH) return false;
+    room.queue.push(item);
+    return true;
+  }
+
+  public removeFromQueue(roomId: string, itemId: string): QueueItem | undefined {
+    const room = this.rooms.get(roomId);
+    if (!room) return undefined;
+    const index = room.queue.findIndex((q) => q.id === itemId);
+    if (index === -1) return undefined;
+    return room.queue.splice(index, 1)[0];
+  }
+
+  public moveInQueue(roomId: string, itemId: string, direction: "up" | "down"): boolean {
+    const room = this.rooms.get(roomId);
+    if (!room) return false;
+    const index = room.queue.findIndex((q) => q.id === itemId);
+    const target = direction === "up" ? index - 1 : index + 1;
+    if (index === -1 || target < 0 || target >= room.queue.length) return false;
+    [room.queue[index], room.queue[target]] = [room.queue[target], room.queue[index]];
+    return true;
   }
 
   public updatePlayback(roomId: string, update: Partial<PlaybackState>) {

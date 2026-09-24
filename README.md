@@ -14,7 +14,10 @@ Watch videos in sync with friends, with video/voice chat, live chat and emoji re
 - Live chat with history on join, clickable video timestamps, unread badge and a People tab
 - Emoji reactions that float over the video (also visible in fullscreen)
 - Friends: requests, accept/decline/cancel/unfriend, one-click room invites with in-app notifications
-- Host & co-host roles with automatic host migration
+- Watch queue: anyone suggests links, hosts reorder / play now, auto-advances when a video ends
+- Typing indicators, keyboard shortcuts (press `?` in a room)
+- Host & co-host roles with automatic host migration; hosts can remove participants and edit room settings (name, privacy, password, capacity)
+- Viewers without a camera or microphone can still join and see/hear everyone
 
 ## Getting started
 
@@ -35,7 +38,12 @@ npm install
 npm run dev                     # http://localhost:5173
 ```
 
-Set `VITE_API_URL` for the client when the API isn't on `http://localhost:5000`.
+### Client environment
+
+| Variable | Purpose |
+| --- | --- |
+| `VITE_API_URL` | API origin (default `http://localhost:5000`) |
+| `VITE_ICE_SERVERS` | Optional JSON array of WebRTC ICE servers. Add a TURN server so calls work behind strict NATs, e.g. `[{"urls":"turn:turn.example.com:3478","username":"u","credential":"p"}]` |
 
 ### Server environment
 

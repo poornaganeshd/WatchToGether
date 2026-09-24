@@ -4,6 +4,7 @@ import jwt from "jsonwebtoken";
 import { RoomManager } from "./managers/RoomManager";
 import * as schemas from "./schemas/socketSchemas";
 import { verifyRoomPassword } from "./utils/roomPassword";
+import { randomUUID } from "crypto";
 
 const prisma = new PrismaClient();
 
@@ -32,6 +33,7 @@ const createLimiter = (max: number, windowMs: number) => {
 
 const chatLimiter = createLimiter(8, 5000);
 const reactionLimiter = createLimiter(10, 3000);
+const queueLimiter = createLimiter(5, 10000);
 
 export const setupSocketHandlers = (io: Server, gracePeriodOrManager?: number | RoomManager) => {
   const roomManager =
@@ -61,7 +63,12 @@ export const setupSocketHandlers = (io: Server, gracePeriodOrManager?: number | 
     socket.on("join_global_room", (data) => {
       const payload = schemas.validateSocketPayload(schemas.joinGlobalRoomSchema, data, socket);
       if (!payload) return;
-      socket.join(`user_${payload.userId}`);
+      // Only allow subscribing to your own notification channel.
+      if (payload.userId !== userId) {
+        socket.emit("error", { message: "Unauthorized userId mismatch" });
+        return;
+      }
+      socket.join(`user_${userId}`);
     });
 
     socket.on("join_room", async (data) => {
@@ -106,6 +113,17 @@ export const setupSocketHandlers = (io: Server, gracePeriodOrManager?: number | 
           }
         }
 
+        // Make sure the in-memory session exists so bans and capacity can be checked.
+        await roomManager.getOrCreateRoom(roomId);
+        if (roomManager.isBanned(roomId, userId)) {
+          socket.emit("error", { message: "You were removed from this room by the host" });
+          return;
+        }
+        if (roomAuth.hostId !== userId && roomManager.isFull(roomId, userId)) {
+          socket.emit("error", { message: "Room is full" });
+          return;
+        }
+
         // Prefer the account name over whatever the client sent.
         const dbUser = await prisma.user.findUnique({ where: { id: userId }, select: { name: true } });
         const displayName = dbUser?.name || userName;
@@ -124,7 +142,8 @@ export const setupSocketHandlers = (io: Server, gracePeriodOrManager?: number | 
         // Send the current authoritative state to the joining user
         if (room) {
           socket.emit("sync_response", { ...room.playback, serverTime: Date.now() });
-          socket.emit("room_state", { hostId: room.hostId, coHosts: Array.from(room.coHosts) });
+          socket.emit("room_state", { hostId: room.hostId, coHosts: Array.from(room.coHosts), startedAt: room.startedAt });
+          socket.emit("queue_updated", room.queue);
           socket.emit("room_participant_statuses", roomManager.getParticipantStatuses(roomId));
           socket.emit("room_participants", roomManager.getParticipants(roomId));
         }
@@ -319,6 +338,127 @@ export const setupSocketHandlers = (io: Server, gracePeriodOrManager?: number | 
       }
     });
 
+    socket.on("kick_participant", async (data) => {
+      const payload = schemas.validateSocketPayload(schemas.targetSocketSchema, data, socket);
+      if (!payload) return;
+      const senderRoomId = roomManager.getSocketRoomId(socket.id);
+      if (senderRoomId !== payload.roomId) return;
+      const room = roomManager.getRoom(senderRoomId);
+      if (!room || !roomManager.isAuthorized(senderRoomId, userId)) return;
+
+      const targetUserId = room.participants.get(payload.targetSocketId);
+      if (!targetUserId || targetUserId === userId || targetUserId === room.hostId) return;
+      // Co-hosts can remove viewers, but only the host can remove another co-host.
+      if (room.coHosts.has(targetUserId) && room.hostId !== userId) {
+        socket.emit("error", { message: "Only the host can remove a co-host" });
+        return;
+      }
+
+      const targetName = room.participantNames.get(payload.targetSocketId) || "A participant";
+      const socketIds = await roomManager.kickUser(senderRoomId, targetUserId);
+      for (const sid of socketIds) {
+        const target = io.sockets.sockets.get(sid);
+        target?.emit("kicked", { roomId: senderRoomId });
+        target?.leave(senderRoomId);
+      }
+      io.to(senderRoomId).emit("participant_kicked", { userId: targetUserId, userName: targetName });
+      io.to(senderRoomId).emit("room_state", { hostId: room.hostId, coHosts: Array.from(room.coHosts), startedAt: room.startedAt });
+    });
+
+    socket.on("typing", (data) => {
+      const p = schemas.validateSocketPayload(schemas.typingSchema, data, socket);
+      if (!p) return;
+      const senderRoomId = roomManager.getSocketRoomId(socket.id);
+      if (senderRoomId !== p.roomId) return;
+      socket.to(senderRoomId).emit("user_typing", {
+        socketId: socket.id,
+        userId,
+        userName: roomManager.getParticipantName(senderRoomId, socket.id) || "Someone",
+        isTyping: p.isTyping,
+      });
+    });
+
+    // --- WATCH QUEUE ---
+    // Anyone can suggest a video; hosts and co-hosts (or whoever added an item) manage it.
+
+    const broadcastQueue = (roomId: string) => {
+      io.to(roomId).emit("queue_updated", roomManager.getQueue(roomId));
+    };
+
+    const playUrlForRoom = (roomId: string, url: string) => {
+      roomManager.updatePlayback(roomId, { url, time: 0, playing: true });
+      io.to(roomId).emit("change_video", { url });
+      io.to(roomId).emit("play_video", { time: 0, serverTime: Date.now() });
+    };
+
+    socket.on("queue_add", (data) => {
+      const p = schemas.validateSocketPayload(schemas.queueAddSchema, data, socket);
+      if (!p) return;
+      const senderRoomId = roomManager.getSocketRoomId(socket.id);
+      if (senderRoomId !== p.roomId) return;
+      if (!queueLimiter.allow(socket.id)) {
+        socket.emit("error", { message: "You're adding videos too quickly" });
+        return;
+      }
+      const added = roomManager.addToQueue(senderRoomId, {
+        id: randomUUID(),
+        url: p.url,
+        addedBy: userId,
+        addedByName: roomManager.getParticipantName(senderRoomId, socket.id) || "Someone",
+      });
+      if (!added) {
+        socket.emit("error", { message: "The queue is full" });
+        return;
+      }
+      broadcastQueue(senderRoomId);
+    });
+
+    socket.on("queue_remove", (data) => {
+      const p = schemas.validateSocketPayload(schemas.queueItemSchema, data, socket);
+      if (!p) return;
+      const senderRoomId = roomManager.getSocketRoomId(socket.id);
+      if (senderRoomId !== p.roomId) return;
+      const item = roomManager.getQueue(senderRoomId).find((q) => q.id === p.itemId);
+      if (!item) return;
+      if (item.addedBy !== userId && !roomManager.isAuthorized(senderRoomId, userId)) return;
+      roomManager.removeFromQueue(senderRoomId, p.itemId);
+      broadcastQueue(senderRoomId);
+    });
+
+    socket.on("queue_move", (data) => {
+      const p = schemas.validateSocketPayload(schemas.queueMoveSchema, data, socket);
+      if (!p) return;
+      const senderRoomId = roomManager.getSocketRoomId(socket.id);
+      if (senderRoomId !== p.roomId || !roomManager.isAuthorized(senderRoomId, userId)) return;
+      if (roomManager.moveInQueue(senderRoomId, p.itemId, p.direction)) {
+        broadcastQueue(senderRoomId);
+      }
+    });
+
+    socket.on("queue_play", (data) => {
+      const p = schemas.validateSocketPayload(schemas.queueItemSchema, data, socket);
+      if (!p) return;
+      const senderRoomId = roomManager.getSocketRoomId(socket.id);
+      if (senderRoomId !== p.roomId || !roomManager.isAuthorized(senderRoomId, userId)) return;
+      const item = roomManager.removeFromQueue(senderRoomId, p.itemId);
+      if (!item) return;
+      playUrlForRoom(senderRoomId, item.url);
+      broadcastQueue(senderRoomId);
+    });
+
+    // Sent by the host's player when a video finishes.
+    socket.on("queue_next", (data) => {
+      const p = schemas.validateSocketPayload(schemas.roomOnlySchema, data, socket);
+      if (!p) return;
+      const senderRoomId = roomManager.getSocketRoomId(socket.id);
+      if (senderRoomId !== p.roomId || !roomManager.isAuthorized(senderRoomId, userId)) return;
+      const next = roomManager.getQueue(senderRoomId)[0];
+      if (!next) return;
+      roomManager.removeFromQueue(senderRoomId, next.id);
+      playUrlForRoom(senderRoomId, next.url);
+      broadcastQueue(senderRoomId);
+    });
+
     // --- WEBRTC SIGNALING ---
     
     socket.on("webrtc_offer", (data) => {
@@ -421,6 +561,7 @@ export const setupSocketHandlers = (io: Server, gracePeriodOrManager?: number | 
       console.log("User disconnected:", socket.id);
       chatLimiter.forget(socket.id);
       reactionLimiter.forget(socket.id);
+      queueLimiter.forget(socket.id);
       roomManager.handleDisconnect(socket.id);
     });
   });

@@ -177,7 +177,76 @@ async function runTests() {
     await wait(400);
     assert(guest.last("new_cohost")?.userId === guestId, "Host can promote a participant in the room");
 
-    console.log("\n--- Test 9: Evicting a room notifies everyone ---");
+    console.log("\n--- Test 9: Notification channels are private ---");
+    guest.socket.emit("join_global_room", { userId: hostId });
+    await wait(300);
+    assert(guest.last("error")?.message === "Unauthorized userId mismatch", "Cannot subscribe to another user's notifications");
+
+    console.log("\n--- Test 10: Typing indicator ---");
+    guest.socket.emit("typing", { roomId: privateRoomId, isTyping: true });
+    await wait(300);
+    assert(host.last("user_typing")?.isTyping === true && host.last("user_typing")?.userName === "Guest Person", "Typing state is relayed with name");
+
+    console.log("\n--- Test 11: Watch queue ---");
+    guest.socket.emit("queue_add", { roomId: privateRoomId, url: "https://example.com/a.mp4" });
+    guest.socket.emit("queue_add", { roomId: privateRoomId, url: "https://example.com/b.mp4" });
+    guest.socket.emit("queue_add", { roomId: privateRoomId, url: "javascript:alert(1)" });
+    await wait(400);
+    let queue = host.last("queue_updated") as { id: string; url: string; addedByName: string }[];
+    assert(queue?.length === 2 && queue[0].addedByName === "Guest Person", "Participants can add http(s) links to the queue", JSON.stringify(queue));
+
+    outsider.socket.emit("queue_remove", { roomId: privateRoomId, itemId: queue[0].id });
+    await wait(300);
+    assert(roomManager.getQueue(privateRoomId).length === 2, "Outsiders cannot remove queue items");
+
+    host.socket.emit("queue_move", { roomId: privateRoomId, itemId: queue[1].id, direction: "up" });
+    await wait(300);
+    queue = host.last("queue_updated");
+    assert(queue[0].url === "https://example.com/b.mp4", "Host can reorder the queue");
+
+    host.socket.emit("queue_next", { roomId: privateRoomId });
+    await wait(400);
+    assert(guest.last("change_video")?.url === "https://example.com/b.mp4", "queue_next plays the first item for everyone");
+    assert(host.last("change_video")?.url === "https://example.com/b.mp4", "The host also receives the queued change");
+    assert(roomManager.getRoom(privateRoomId)?.playback.url === "https://example.com/b.mp4", "Server playback state follows the queue");
+    assert(roomManager.getQueue(privateRoomId).length === 1, "Played item leaves the queue");
+
+    console.log("\n--- Test 12: Session start time is shared ---");
+    const startedAt = guest.last("room_state")?.startedAt;
+    assert(typeof startedAt === "number" && Date.now() - startedAt < 60000, "room_state includes when the session started");
+
+    console.log("\n--- Test 13: Kicking participants ---");
+    await outsider.join(privateRoomId, "secret");
+    const outsiderSocketId = outsider.socket.id!;
+    guest.socket.emit("kick_participant", { roomId: privateRoomId, targetSocketId: host.socket.id });
+    await wait(300);
+    assert(!!roomManager.getRoom(privateRoomId)?.participants.has(host.socket.id!), "Nobody can kick the host");
+
+    host.socket.emit("kick_participant", { roomId: privateRoomId, targetSocketId: outsiderSocketId });
+    await wait(500);
+    assert(outsider.last("kicked")?.roomId === privateRoomId, "Kicked user is told they were removed");
+    assert(host.last("participant_kicked")?.userId === outsiderId, "Room is told who was removed");
+    assert(!roomManager.getRoom(privateRoomId)?.participants.has(outsiderSocketId), "Kicked socket leaves the room");
+
+    await outsider.join(privateRoomId, "secret");
+    assert(outsider.last("error")?.message === "You were removed from this room by the host", "Kicked user cannot rejoin the session");
+
+    console.log("\n--- Test 14: Room capacity ---");
+    roomManager.updateSettings(privateRoomId, { maxParticipants: 2 });
+    const third = new TestClient(outsiderId, "Outsider", url, jwt.sign({ userId: outsiderId }, JWT_SECRET));
+    roomManager.getRoom(privateRoomId)!.bannedUserIds.clear();
+    await third.connect();
+    await third.join(privateRoomId, "secret");
+    assert(third.last("error")?.message === "Room is full", "Joining a full room is rejected");
+    third.disconnect();
+
+    console.log("\n--- Test 15: Accurate saved playback position ---");
+    const now = Date.now();
+    const pos = roomManager.getCurrentPlaybackTime({ playing: true, time: 10, url: "", lastUpdatedAt: now - 5000 });
+    assert(pos >= 14.9 && pos <= 15.5, "Playing position is extrapolated from the last update", String(pos));
+    assert(roomManager.getCurrentPlaybackTime({ playing: false, time: 10, url: "", lastUpdatedAt: now - 5000 }) === 10, "Paused position is unchanged");
+
+    console.log("\n--- Test 16: Evicting a room notifies everyone ---");
     roomManager.evictRoom(privateRoomId);
     await wait(300);
     assert(guest.last("room_ended")?.roomId === privateRoomId, "Participants receive room_ended");

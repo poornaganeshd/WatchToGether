@@ -82,6 +82,30 @@ export const reactionSchema = z.object({
   emoji: z.enum(ALLOWED_REACTIONS),
 });
 
+export const targetSocketSchema = z.object({
+  roomId: z.string().uuid(),
+  targetSocketId: z.string().min(1).max(100),
+});
+
+export const typingSchema = z.object({
+  roomId: z.string().uuid(),
+  isTyping: z.boolean(),
+});
+
+export const queueAddSchema = z.object({
+  roomId: z.string().uuid(),
+  url: z.string().trim().url().max(2000).refine((u) => /^https?:\/\//i.test(u), "Only http(s) links are supported"),
+});
+
+export const queueItemSchema = z.object({
+  roomId: z.string().uuid(),
+  itemId: z.string().min(1).max(100),
+});
+
+export const queueMoveSchema = queueItemSchema.extend({
+  direction: z.enum(["up", "down"]),
+});
+
 export const validateSocketPayload = <T>(schema: z.ZodType<T>, data: unknown, socket: Socket): T | null => {
   const result = schema.safeParse(data);
   if (!result.success) {

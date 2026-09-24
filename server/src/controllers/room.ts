@@ -37,6 +37,14 @@ const createRoomSchema = z.object({
   password: z.string().max(100, "Password is too long").optional(),
 });
 
+const updateRoomSchema = z.object({
+  name: z.string().trim().min(1, "Room name is required").max(100, "Room name is too long").optional(),
+  isPrivate: z.boolean().optional(),
+  // Omit to keep the current password.
+  password: z.string().max(100, "Password is too long").optional(),
+  maxParticipants: z.number().int().min(2, "Rooms need room for at least 2 people").max(50, "Rooms are limited to 50 people").optional(),
+});
+
 const inviteSchema = z.object({
   email: z.string().trim().email("Invalid email address"),
 });
@@ -361,6 +369,65 @@ export const endRoom = async (req: AuthRequest, res: Response): Promise<void> =>
     res.status(200).json({ message: "Room ended successfully" });
   } catch (error) {
     console.error("End Room Error:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+};
+
+export const updateRoom = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const id = req.params.id as string;
+    const parsed = updateRoomSchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      res.status(400).json({ error: parsed.error.issues[0].message });
+      return;
+    }
+
+    const room = await prisma.room.findUnique({ where: { id } });
+    if (!room) {
+      res.status(404).json({ error: "Room not found" });
+      return;
+    }
+    if (room.hostId !== req.userId) {
+      res.status(403).json({ error: "Forbidden: Only the host can change room settings" });
+      return;
+    }
+
+    const { name, isPrivate, password, maxParticipants } = parsed.data;
+    const nextPrivate = isPrivate ?? room.isPrivate;
+    const trimmedPassword = password?.trim();
+
+    let nextPassword: string | null | undefined;
+    if (!nextPrivate) {
+      nextPassword = null;
+    } else if (trimmedPassword) {
+      nextPassword = await hashRoomPassword(trimmedPassword);
+    } else if (!room.password) {
+      res.status(400).json({ error: "Private rooms need a password" });
+      return;
+    }
+
+    const updated = await prisma.room.update({
+      where: { id },
+      data: {
+        ...(name !== undefined ? { name } : {}),
+        isPrivate: nextPrivate,
+        ...(nextPassword !== undefined ? { password: nextPassword } : {}),
+        ...(maxParticipants !== undefined ? { maxParticipants } : {}),
+      },
+      select: publicRoomSelect,
+    });
+
+    const roomManager = req.app.get("roomManager") as RoomManager | undefined;
+    roomManager?.updateSettings(id, { maxParticipants: updated.maxParticipants });
+    req.app.get("io")?.to(id).emit("room_updated", {
+      name: updated.name,
+      isPrivate: updated.isPrivate,
+      maxParticipants: updated.maxParticipants,
+    });
+
+    res.status(200).json({ room: updated });
+  } catch (error) {
+    console.error("Update Room Error:", error);
     res.status(500).json({ error: "Internal server error" });
   }
 };

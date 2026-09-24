@@ -30,6 +30,19 @@ export interface Reaction {
   userName: string;
 }
 
+export interface QueueItem {
+  id: string;
+  url: string;
+  addedBy: string;
+  addedByName: string;
+}
+
+export interface RoomInfoUpdate {
+  name: string;
+  isPrivate: boolean;
+  maxParticipants: number;
+}
+
 export type RoomAccessError = 'password_required' | 'incorrect_password' | null;
 
 const MAX_MESSAGES = 300;
@@ -45,6 +58,10 @@ interface SocketState {
   reconnectError: string | null;
   roomAccessError: RoomAccessError;
   endedRoomId: string | null;
+  exitReason: 'kicked' | 'full' | null;
+  queue: QueueItem[];
+  typingUsers: Record<string, string>; // socketId -> name
+  roomInfo: RoomInfoUpdate | null;
   currentRoomSession: RoomSession | null;
   connect: () => void;
   disconnect: () => void;
@@ -52,11 +69,22 @@ interface SocketState {
   leaveRoom: (roomId: string, userId: string, userName: string) => void;
   sendMessage: (roomId: string, userId: string, userName: string, content: string) => void;
   sendReaction: (roomId: string, emoji: string) => void;
+  setTyping: (roomId: string, isTyping: boolean) => void;
   addMessage: (message: Message) => void;
   clearMessages: () => void;
   setChatVisible: (visible: boolean) => void;
   clearEndedRoom: () => void;
+  clearExitReason: () => void;
 }
+
+const typingTimers: Record<string, ReturnType<typeof setTimeout>> = {};
+
+const dropTyping = (typing: Record<string, string>, socketId: string) => {
+  if (!(socketId in typing)) return typing;
+  const next = { ...typing };
+  delete next[socketId];
+  return next;
+};
 
 const appendMessage = (messages: Message[], message: Message) => {
   if (messages.some((m) => m.id === message.id)) return messages;
@@ -75,6 +103,10 @@ export const useSocketStore = create<SocketState>((set, get) => ({
   reconnectError: null,
   roomAccessError: null,
   endedRoomId: null,
+  exitReason: null,
+  queue: [],
+  typingUsers: {},
+  roomInfo: null,
   currentRoomSession: null,
 
   connect: () => {
@@ -114,6 +146,9 @@ export const useSocketStore = create<SocketState>((set, get) => ({
       socket.on('receive_message', (message: Message) => {
         set((state) => ({
           messages: appendMessage(state.messages, message),
+          typingUsers: Object.fromEntries(
+            Object.entries(state.typingUsers).filter(([, name]) => name !== message.userName)
+          ),
           unreadCount:
             state.isChatVisible || message.userId === useAuthStore.getState().user?.id
               ? state.unreadCount
@@ -140,11 +175,43 @@ export const useSocketStore = create<SocketState>((set, get) => ({
 
       socket.on('user_left', ({ socketId }: { socketId: string }) => {
         set((state) => {
-          if (!state.participants[socketId]) return state;
+          const typingUsers = dropTyping(state.typingUsers, socketId);
+          if (!state.participants[socketId]) return { typingUsers };
           const next = { ...state.participants };
           delete next[socketId];
-          return { participants: next };
+          return { participants: next, typingUsers };
         });
+      });
+
+      socket.on('user_typing', ({ socketId, userName, isTyping }: { socketId: string; userName: string; isTyping: boolean }) => {
+        clearTimeout(typingTimers[socketId]);
+        if (isTyping) {
+          set((state) => ({ typingUsers: { ...state.typingUsers, [socketId]: userName } }));
+          // Clear stale indicators if the "stopped" event never arrives.
+          typingTimers[socketId] = setTimeout(() => {
+            set((state) => ({ typingUsers: dropTyping(state.typingUsers, socketId) }));
+          }, 6000);
+        } else {
+          set((state) => ({ typingUsers: dropTyping(state.typingUsers, socketId) }));
+        }
+      });
+
+      socket.on('queue_updated', (queue: QueueItem[]) => {
+        set({ queue });
+      });
+
+      socket.on('room_updated', (info: RoomInfoUpdate) => {
+        set({ roomInfo: info });
+      });
+
+      socket.on('kicked', ({ roomId }: { roomId: string }) => {
+        if (get().currentRoomSession?.roomId === roomId) {
+          set({ exitReason: 'kicked', currentRoomSession: null });
+        }
+      });
+
+      socket.on('participant_kicked', ({ userName }: { userName: string }) => {
+        toast.info(`${userName} was removed from the room`);
       });
 
       socket.on('reaction', ({ emoji, userName, socketId }: { emoji: string; userName: string; socketId: string }) => {
@@ -166,7 +233,13 @@ export const useSocketStore = create<SocketState>((set, get) => ({
         const errorMsg = typeof err === 'object' && err !== null && 'message' in err
           ? String((err as { message?: string }).message)
           : String(err);
-        if (errorMsg.includes("Incorrect password")) {
+        if (errorMsg.includes("removed from this room")) {
+          set({ exitReason: 'kicked', currentRoomSession: null });
+        } else if (errorMsg.includes("Room is full")) {
+          set({ exitReason: 'full', currentRoomSession: null });
+        } else if (errorMsg.includes("Only the host") || errorMsg.includes("queue is full") || errorMsg.includes("too quickly")) {
+          toast.error(errorMsg);
+        } else if (errorMsg.includes("Incorrect password")) {
           set({ roomAccessError: 'incorrect_password' });
         } else if (errorMsg.includes("Password required")) {
           set({ roomAccessError: 'password_required' });
@@ -198,7 +271,7 @@ export const useSocketStore = create<SocketState>((set, get) => ({
 
   joinRoom: (roomId, userId, userName, password) => {
     const session: RoomSession = { roomId, userId, userName, password };
-    set({ currentRoomSession: session, reconnectError: null, roomAccessError: null, endedRoomId: null });
+    set({ currentRoomSession: session, reconnectError: null, roomAccessError: null, endedRoomId: null, exitReason: null });
     const { socket } = get();
     if (socket && socket.connected) {
       socket.emit('join_room', session);
@@ -206,7 +279,7 @@ export const useSocketStore = create<SocketState>((set, get) => ({
   },
 
   leaveRoom: (roomId, userId, userName) => {
-    set({ currentRoomSession: null, reconnectError: null, roomAccessError: null, participants: {}, reactions: [] });
+    set({ currentRoomSession: null, reconnectError: null, roomAccessError: null, participants: {}, reactions: [], queue: [], typingUsers: {}, roomInfo: null });
     const { socket } = get();
     if (socket) {
       socket.emit('leave_room', { roomId, userId, userName });
@@ -224,6 +297,10 @@ export const useSocketStore = create<SocketState>((set, get) => ({
     get().socket?.emit('send_reaction', { roomId, emoji });
   },
 
+  setTyping: (roomId, isTyping) => {
+    get().socket?.emit('typing', { roomId, isTyping });
+  },
+
   addMessage: (message) => set((state) => ({ messages: appendMessage(state.messages, message) })),
 
   clearMessages: () => set({ messages: [], unreadCount: 0 }),
@@ -231,6 +308,8 @@ export const useSocketStore = create<SocketState>((set, get) => ({
   setChatVisible: (visible) => set(visible ? { isChatVisible: true, unreadCount: 0 } : { isChatVisible: false }),
 
   clearEndedRoom: () => set({ endedRoomId: null }),
+
+  clearExitReason: () => set({ exitReason: null }),
 }));
 
 if (typeof window !== 'undefined') {

@@ -8,10 +8,12 @@ import RemoteAudioManager from "../components/RemoteAudioManager";
 import { useWebRTC } from "../hooks/useWebRTC";
 import { useVoiceActivityDetection } from "../hooks/useVoiceActivityDetection";
 import { useAudioStore } from "../store/useAudioStore";
-import { Mic2, MessageSquare, Users, ChevronRight, Share2, LogOut, Copy, Check, WifiOff } from "lucide-react";
+import { Mic2, MessageSquare, Users, ChevronRight, Share2, LogOut, Copy, Check, WifiOff, SlidersHorizontal } from "lucide-react";
 import api, { getErrorMessage } from "../lib/api";
 import AudioSettingsModal from "../components/AudioSettingsModal";
 import InviteModal from "../components/InviteModal";
+import RoomSettingsModal from "../components/RoomSettingsModal";
+import Modal from "../components/ui/Modal";
 import ChatPanel from "../components/ChatPanel";
 import PasswordPrompt from "../components/PasswordPrompt";
 import { ReactionOverlay, ReactionPicker } from "../components/Reactions";
@@ -24,17 +26,22 @@ export default function Room() {
   const location = useLocation();
   const { user } = useAuthStore();
   const navigate = useNavigate();
-  const { socket, connect, joinRoom, leaveRoom, clearMessages, connectionStatus, reconnectError, roomAccessError, endedRoomId, clearEndedRoom, unreadCount, participants } = useSocketStore();
+  const { socket, connect, joinRoom, leaveRoom, clearMessages, connectionStatus, reconnectError, roomAccessError, endedRoomId, clearEndedRoom, unreadCount, participants, exitReason, clearExitReason, roomInfo } = useSocketStore();
   const { getLocalStream, localStream, localStreamState, screenStreamState, peers, peerStatuses, screenShares, toggleAudio, toggleVideo, shareScreen, broadcastMediaStream } = useWebRTC(id || "");
   const [isInviteModalOpen, setIsInviteModalOpen] = useState(false);
   const [mainScreenSource, setMainScreenSource] = useState<'url' | string>('url');
   const [roomCreatedAt, setRoomCreatedAt] = useState<string | null>(null);
+  const [sessionStartedAt, setSessionStartedAt] = useState<number | null>(null);
+  const [roomSettings, setRoomSettings] = useState<{ name: string; isPrivate: boolean; maxParticipants: number } | null>(null);
+  const [isRoomSettingsOpen, setIsRoomSettingsOpen] = useState(false);
+  const [isShortcutsOpen, setIsShortcutsOpen] = useState(false);
   const [roomDisplayId, setRoomDisplayId] = useState<string | null>(null);
   const [roomName, setRoomName] = useState<string | null>(null);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [hostId, setHostId] = useState<string | null>(null);
   const [coHostIds, setCoHostIds] = useState<string[]>([]);
   const isHost = !!user && (hostId === user.id || coHostIds.includes(user.id));
+  const isRoomHost = !!user && hostId === user.id;
   const [isChatOpen, setIsChatOpen] = useState(() => typeof window !== "undefined" && window.innerWidth >= 1280);
   const [passwordPrompt, setPasswordPrompt] = useState<{ open: boolean; error: string | null }>({ open: false, error: null });
   const [codeCopied, setCodeCopied] = useState(false);
@@ -149,6 +156,7 @@ export default function Room() {
       setRoomCreatedAt(room.createdAt);
       setRoomDisplayId(room.displayId);
       setRoomName(room.name);
+      setRoomSettings({ name: room.name, isPrivate: room.isPrivate, maxParticipants: room.maxParticipants ?? 10 });
       setHostId(room.hostId);
       const coHosts: string[] = (room.coHosts ?? []).map((ch: { userId: string }) => ch.userId);
       setCoHostIds(coHosts);
@@ -208,7 +216,8 @@ export default function Room() {
       }
     };
 
-    const handleRoomState = ({ hostId: nextHostId, coHosts }: { hostId: string, coHosts: string[] }) => {
+    const handleRoomState = ({ hostId: nextHostId, coHosts, startedAt }: { hostId: string, coHosts: string[], startedAt?: number }) => {
+      if (startedAt) setSessionStartedAt(startedAt);
       setHostId(nextHostId);
       setCoHostIds(coHosts);
     };
@@ -232,17 +241,18 @@ export default function Room() {
   }, [socket, user]);
 
   useEffect(() => {
-    if (!roomCreatedAt) return;
+    const startMs = sessionStartedAt ?? (roomCreatedAt ? new Date(roomCreatedAt).getTime() : null);
+    if (!startMs) return;
     
     const interval = setInterval(() => {
-      const diff = Math.floor((Date.now() - new Date(roomCreatedAt).getTime()) / 1000);
+      const diff = Math.max(0, Math.floor((Date.now() - startMs) / 1000));
       const h = Math.floor(diff / 3600).toString().padStart(2, '0');
       const m = Math.floor((diff % 3600) / 60).toString().padStart(2, '0');
       const s = (diff % 60).toString().padStart(2, '0');
       setDuration(`${h}:${m}:${s}`);
     }, 1000);
     return () => clearInterval(interval);
-  }, [roomCreatedAt]);
+  }, [roomCreatedAt, sessionStartedAt]);
 
   // Automatically promote incoming screen-share / captured local video to main movie stage,
   // and cleanly revert to 'url' when the broadcast ends.
@@ -313,9 +323,68 @@ export default function Room() {
 
   useVoiceActivityDetection(id, localStreamState);
 
+  const shortcutHandlersRef = useRef({ toggleAudio, toggleVideo });
+  useEffect(() => {
+    shortcutHandlersRef.current = { toggleAudio, toggleVideo };
+  });
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement | null;
+      const isTyping = target?.nodeName === 'INPUT' || target?.nodeName === 'TEXTAREA' || target?.nodeName === 'SELECT' || target?.isContentEditable;
+      if (isTyping || e.metaKey || e.ctrlKey || e.altKey || document.querySelector('[role="dialog"]')) return;
+      switch (e.key.toLowerCase()) {
+        case 'm':
+          shortcutHandlersRef.current.toggleAudio();
+          break;
+        case 'v':
+          shortcutHandlersRef.current.toggleVideo();
+          break;
+        case 'c':
+          setIsChatOpen((open) => !open);
+          break;
+        case 'i':
+          setIsInviteModalOpen(true);
+          break;
+        case '?':
+          setIsShortcutsOpen(true);
+          break;
+      }
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, []);
+
   const addActiveSpeaker = useAudioStore(state => state.addActiveSpeaker);
   const removeActiveSpeaker = useAudioStore(state => state.removeActiveSpeaker);
   const setHostAnnouncement = useAudioStore(state => state.setHostAnnouncement);
+  const setHostSocketId = useAudioStore(state => state.setHostSocketId);
+
+  // Smart volume ducks deeper when the host talks; it needs the host's socket id.
+  useEffect(() => {
+    const hostSocket = Object.values(participants).find((p) => p.userId === hostId)?.socketId ?? null;
+    setHostSocketId(hostSocket);
+  }, [participants, hostId, setHostSocketId]);
+
+  useEffect(() => () => setHostSocketId(null), [setHostSocketId]);
+
+  useEffect(() => {
+    if (!exitReason) return;
+    clearExitReason();
+    if (exitReason === 'kicked') {
+      toast.error("You were removed from this room by the host.");
+    } else {
+      toast.error("This room is full.");
+    }
+    navigate("/dashboard");
+  }, [exitReason, clearExitReason, navigate]);
+
+  useEffect(() => {
+    if (!roomInfo) return;
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setRoomName(roomInfo.name);
+    setRoomSettings(roomInfo);
+  }, [roomInfo]);
 
   useEffect(() => {
     if (!socket) return;
@@ -467,6 +536,16 @@ export default function Room() {
             <div className="absolute top-4 right-4 z-50 flex items-center gap-2 max-md:right-16">
               <div className="hidden items-center gap-2 rounded-xl border border-white/10 bg-ink-900/80 py-1.5 pl-3 pr-1.5 text-sm text-white shadow-lg backdrop-blur-md sm:flex">
                 <span className="max-w-[14rem] truncate font-semibold">{roomName || 'Room'}</span>
+                {isRoomHost && roomSettings && (
+                  <button
+                    onClick={() => setIsRoomSettingsOpen(true)}
+                    className="rounded-lg p-1 text-slate-400 transition-colors hover:bg-white/10 hover:text-white"
+                    title="Room settings"
+                    aria-label="Room settings"
+                  >
+                    <SlidersHorizontal size={14} />
+                  </button>
+                )}
                 {roomDisplayId && (
                   <button
                     onClick={handleCopyCode}
@@ -492,7 +571,7 @@ export default function Room() {
                 className={isFullscreen ? "w-[100vw] h-[100vh] max-w-none max-h-none flex-1 flex" : "w-full h-full flex-1 flex"}
                 style={isFullscreen ? { width: '100vw', height: '100vh', maxWidth: 'none', maxHeight: 'none' } : undefined}
               >
-                <VideoPlayer ref={videoPlayerRef} roomId={id} isFullscreen={isFullscreen} isHost={isHost} broadcastMediaStream={broadcastMediaStream} shareScreen={shareScreen} />
+                <VideoPlayer ref={videoPlayerRef} roomId={id} isFullscreen={isFullscreen} isHost={isHost} isRoomHost={isRoomHost} broadcastMediaStream={broadcastMediaStream} shareScreen={shareScreen} />
               </div>
             ) : null
           ) : (
@@ -508,7 +587,7 @@ export default function Room() {
                     className={isFullscreen ? "w-[100vw] h-[100vh] max-w-none max-h-none flex-1 flex" : "w-full h-full flex-1 flex"}
                     style={isFullscreen ? { width: '100vw', height: '100vh', maxWidth: 'none', maxHeight: 'none' } : undefined}
                   >
-                    <VideoPlayer ref={videoPlayerRef} roomId={id} isFullscreen={isFullscreen} isHost={isHost} broadcastMediaStream={broadcastMediaStream} shareScreen={shareScreen} />
+                    <VideoPlayer ref={videoPlayerRef} roomId={id} isFullscreen={isFullscreen} isHost={isHost} isRoomHost={isRoomHost} broadcastMediaStream={broadcastMediaStream} shareScreen={shareScreen} />
                   </div>
                 ) : null;
               }
@@ -672,9 +751,44 @@ export default function Room() {
           onOpenInvite={() => setIsInviteModalOpen(true)}
           onOpenSettings={() => setIsSettingsOpen(true)}
           onClose={() => setIsChatOpen(false)}
+          onMakeCoHost={(targetSocketId) => socket?.emit("make_cohost", { roomId: id, targetSocketId })}
+          onKick={(targetSocketId, name) => {
+            if (confirm(`Remove ${name} from this room? They won't be able to rejoin this session.`)) {
+              socket?.emit("kick_participant", { roomId: id, targetSocketId });
+            }
+          }}
         />
       )}
       <AudioSettingsModal isOpen={isSettingsOpen} onClose={() => setIsSettingsOpen(false)} />
+      {id && roomSettings && isRoomSettingsOpen && (
+        <RoomSettingsModal
+          isOpen
+          roomId={id}
+          initial={roomSettings}
+          onClose={() => setIsRoomSettingsOpen(false)}
+          onSaved={(next) => {
+            setRoomSettings(next);
+            setRoomName(next.name);
+          }}
+        />
+      )}
+      <Modal isOpen={isShortcutsOpen} onClose={() => setIsShortcutsOpen(false)} title="Keyboard shortcuts">
+        <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-2.5 p-5 text-sm">
+          {[
+            ["F", "Toggle fullscreen"],
+            ["M", "Mute / unmute microphone"],
+            ["V", "Turn camera on / off"],
+            ["C", "Open / close chat"],
+            ["I", "Invite people"],
+            ["?", "Show this help"],
+          ].map(([key, label]) => (
+            <div key={key} className="contents">
+              <dt><kbd className="rounded-md border border-white/15 bg-white/5 px-2 py-0.5 font-mono text-xs text-white">{key}</kbd></dt>
+              <dd className="text-slate-300">{label}</dd>
+            </div>
+          ))}
+        </dl>
+      </Modal>
       {id && <InviteModal isOpen={isInviteModalOpen} onClose={() => setIsInviteModalOpen(false)} roomId={id} roomCode={roomDisplayId} />}
       <PasswordPrompt
         key={passwordPrompt.error ?? "prompt"}

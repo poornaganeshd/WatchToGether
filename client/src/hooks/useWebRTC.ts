@@ -7,6 +7,38 @@ interface PeerConnection {
   [socketId: string]: RTCPeerConnection;
 }
 
+const DEFAULT_ICE_SERVERS: RTCIceServer[] = [
+  { urls: "stun:stun.l.google.com:19302" },
+  { urls: "stun:stun1.l.google.com:19302" },
+];
+
+// STUN alone fails behind symmetric NATs and many corporate/mobile networks, so allow
+// a TURN server to be configured, e.g.
+// VITE_ICE_SERVERS='[{"urls":"turn:turn.example.com:3478","username":"u","credential":"p"}]'
+const ICE_SERVERS: RTCIceServer[] = (() => {
+  const raw = import.meta.env.VITE_ICE_SERVERS;
+  if (!raw) return DEFAULT_ICE_SERVERS;
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) && parsed.length > 0 ? parsed : DEFAULT_ICE_SERVERS;
+  } catch {
+    console.warn("VITE_ICE_SERVERS is not valid JSON; falling back to public STUN servers");
+    return DEFAULT_ICE_SERVERS;
+  }
+})();
+
+// Match senders by their transceiver's media kind. A sender whose track was replaced with null
+// could otherwise be an audio *or* video slot.
+const findSenderByKind = (pc: RTCPeerConnection, kind: "audio" | "video"): RTCRtpSender | undefined => {
+  if (typeof pc.getTransceivers === "function") {
+    const transceiver = pc.getTransceivers().find(
+      (t) => t.receiver?.track?.kind === kind || (t.sender?.track && t.sender.track.kind === kind)
+    );
+    if (transceiver) return transceiver.sender;
+  }
+  return pc.getSenders().find((s) => s.track?.kind === kind);
+};
+
 const findVideoSender = (pc: RTCPeerConnection): RTCRtpSender | undefined => {
   if (typeof pc.getTransceivers === "function") {
     const videoTransceiver = pc.getTransceivers().find(
@@ -79,7 +111,13 @@ export function useWebRTC(roomId: string) {
             stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
           } catch (retryErr) {
             console.warn("Retry failed, falling back to audio-only (preserving wt_pref_camera preference):", retryErr);
-            stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            try {
+              stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            } catch (audioErr) {
+              // No microphone (or it was denied) but a camera may still work.
+              console.warn("Audio-only failed, trying camera-only:", audioErr);
+              stream = await navigator.mediaDevices.getUserMedia({ video: true });
+            }
             // IMPORTANT: Never write wt_pref_camera = 'false' here on transient hardware failure
           }
         }
@@ -104,10 +142,15 @@ export function useWebRTC(roomId: string) {
 
       return stream;
     } catch (err) {
-      console.error("Failed to get any local stream", err);
-      if (resolveMedia) resolveMedia(null);
+      // No usable devices or permission denied: join as a receive-only participant with an empty
+      // stream, so peer connections are still created and camera/mic can be enabled later.
+      console.error("Failed to get any local stream, joining without camera/mic", err);
+      const emptyStream = new MediaStream();
+      localStream.current = emptyStream;
+      setLocalStreamState(emptyStream);
+      if (resolveMedia) resolveMedia(emptyStream);
       socket?.emit("participant_status", { roomId, cam: false, mic: false });
-      return null;
+      return emptyStream;
     }
   };
 
@@ -118,12 +161,7 @@ export function useWebRTC(roomId: string) {
     if (!socket || !user) return;
 
     const createPeerConnection = (peerSocketId: string, stream: MediaStream) => {
-      const pc = new RTCPeerConnection({
-        iceServers: [
-          { urls: "stun:stun.l.google.com:19302" },
-          { urls: "stun:stun1.l.google.com:19302" },
-        ],
-      });
+      const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
 
       pc.onicecandidate = (event) => {
         if (!isMounted || pc.signalingState === "closed") return;
@@ -209,6 +247,15 @@ export function useWebRTC(roomId: string) {
           pc.addTransceiver("video", { direction: "sendrecv", streams: [stream] });
         } catch (e) {
           console.warn("Could not pre-add video transceiver", e);
+        }
+      }
+      // Same for audio, so people without a microphone still receive everyone else's audio
+      // and can enable their mic later.
+      if (stream.getAudioTracks().length === 0 && typeof pc.addTransceiver === "function") {
+        try {
+          pc.addTransceiver("audio", { direction: "sendrecv", streams: [stream] });
+        } catch (e) {
+          console.warn("Could not pre-add audio transceiver", e);
         }
       }
 
@@ -523,7 +570,7 @@ export function useWebRTC(roomId: string) {
         // 1. Disassociate RTP senders from video track on all peer connections
         await Promise.all(
           Object.values(peerConnections.current).map(async (pc) => {
-            const sender = findVideoSender(pc);
+            const sender = findSenderByKind(pc, "video") ?? findVideoSender(pc);
             if (sender && typeof sender.replaceTrack === "function") {
               await sender.replaceTrack(null).catch((e) => console.warn("replaceTrack(null) error:", e));
             }
@@ -551,7 +598,7 @@ export function useWebRTC(roomId: string) {
           // Attach new track to all peer connections
           await Promise.all(
             Object.values(peerConnections.current).map(async (pc) => {
-              const sender = findVideoSender(pc);
+              const sender = findSenderByKind(pc, "video") ?? findVideoSender(pc);
               if (sender && typeof sender.replaceTrack === "function") {
                 await sender.replaceTrack(newVideoTrack).catch((e) => console.warn("replaceTrack error:", e));
               } else {
@@ -596,9 +643,9 @@ export function useWebRTC(roomId: string) {
         localStorage.setItem('wt_pref_mic', 'true');
         
         Object.values(peerConnections.current).forEach((pc) => {
-          const sender = pc.getSenders().find((s) => s.track === null || (s.track && s.track.kind === 'audio'));
+          const sender = findSenderByKind(pc, 'audio');
           if (sender) {
-            sender.replaceTrack(newAudioTrack);
+            sender.replaceTrack(newAudioTrack).catch((e) => console.warn("replaceTrack(audio) error:", e));
           } else {
             pc.addTrack(newAudioTrack, localStream.current!);
           }

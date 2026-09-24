@@ -32,6 +32,7 @@ interface RoomSummary {
   host: { name: string };
   createdAt: string;
   visitedAt?: string;
+  maxParticipants?: number;
   _count?: { participants: number };
 }
 
@@ -474,6 +475,7 @@ export default function Dashboard() {
                       </span>
                       <span className="flex items-center gap-1">
                         <Users size={13} /> {room._count?.participants ?? 0}
+                        {room.maxParticipants ? <span className="text-slate-600">/{room.maxParticipants}</span> : null}
                       </span>
                     </div>
                   </button>
