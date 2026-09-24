@@ -1,8 +1,11 @@
-import { useState, useRef, useEffect, forwardRef, useImperativeHandle } from "react";
+import { useState, useRef, useEffect, forwardRef, useImperativeHandle, useCallback } from "react";
 import ReactPlayer from "react-player";
 import { useSocketStore } from "../store/useSocketStore";
 import { useAudioStore } from "../store/useAudioStore";
-import { FileVideo, Link2, MonitorPlay, MonitorUp, RefreshCcw, Square } from "lucide-react";
+import { Captions, CaptionsOff, FileText, FileVideo, Link2, MonitorPlay, MonitorUp, RefreshCcw, Square, X } from "lucide-react";
+import SubtitleOverlay from "./SubtitleOverlay";
+import { toWebVtt } from "../lib/subtitles";
+import { toast } from "../store/useToastStore";
 
 export interface VideoPlayerRef {
   seekTo: (time: number) => void;
@@ -22,6 +25,9 @@ interface VideoPlayerProps {
 
 const VideoPlayer = forwardRef<VideoPlayerRef, VideoPlayerProps>(({ roomId, isFullscreen = false, isHost, isRoomHost = false, broadcastMediaStream, shareScreen }, ref) => {
   const { socket } = useSocketStore();
+  const subtitles = useSocketStore((s) => s.subtitles);
+  const [showSubtitles, setShowSubtitles] = useState(() => localStorage.getItem("wt_pref_subtitles") !== "false");
+  const bufferingRef = useRef(false);
   const [url, setUrl] = useState("https://www.youtube.com/watch?v=aqz-KE-bpKQ");
   const [inputUrl, setInputUrl] = useState("");
   const [playing, setPlaying] = useState(false);
@@ -156,6 +162,11 @@ const VideoPlayer = forwardRef<VideoPlayerRef, VideoPlayerProps>(({ roomId, isFu
       }
     }
   };
+
+  const readCurrentTime = useCallback(() => {
+    const player = playerRef.current;
+    return player && typeof player.getCurrentTime === "function" ? player.getCurrentTime() || 0 : 0;
+  }, []);
 
   useImperativeHandle(ref, () => ({
     seekTo: (time: number) => {
@@ -393,6 +404,73 @@ const VideoPlayer = forwardRef<VideoPlayerRef, VideoPlayerProps>(({ roomId, isFu
     socket?.emit("request_sync", { roomId });
   };
 
+  // Everyone except the room clock reports how well they're keeping up, so hosts can see
+  // who is buffering or drifting before pressing play.
+  const sendSyncReport = useCallback(() => {
+    if (!socket || isRoomHostRef.current || !urlRef.current) return;
+    const syncState = lastSyncStateRef.current;
+    let drift = 0;
+    if (syncState && playerRef.current && typeof playerRef.current.getCurrentTime === "function") {
+      drift = calculateExpectedTime(syncState) - (playerRef.current.getCurrentTime() || 0);
+    }
+    let state: "synced" | "drifting" | "buffering" | "error" = "synced";
+    if (erroredUrlRef.current === urlRef.current) state = "error";
+    else if (bufferingRef.current) state = "buffering";
+    else if (Math.abs(drift) > 1.5) state = "drifting";
+    socket.emit("playback_report", { roomId, state, drift: Number.isFinite(drift) ? drift : 0 });
+  }, [socket, roomId]);
+
+  useEffect(() => {
+    if (isRoomHost || !socket) return;
+    const id = setInterval(sendSyncReport, 4000);
+    return () => clearInterval(id);
+  }, [isRoomHost, socket, sendSyncReport]);
+
+  const handleBuffer = () => {
+    bufferingRef.current = true;
+    sendSyncReport();
+  };
+
+  const handleBufferEnd = () => {
+    bufferingRef.current = false;
+    sendSyncReport();
+  };
+
+  const handleSubtitleFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (!file) return;
+    if (file.size > 300 * 1024) {
+      toast.error("Subtitle files must be under 300 KB");
+      return;
+    }
+    const vtt = toWebVtt(await file.text());
+    if (!vtt.includes("-->")) {
+      toast.error("That doesn't look like an .srt or .vtt subtitle file");
+      return;
+    }
+    socket?.emit("subtitles_set", { roomId, label: file.name.replace(/\.(srt|vtt)$/i, "").slice(0, 100) || "Subtitles", vtt });
+  };
+
+  const toggleSubtitles = () => {
+    setShowSubtitles((v) => {
+      localStorage.setItem("wt_pref_subtitles", String(!v));
+      return !v;
+    });
+  };
+
+  const subtitleToggle = subtitles ? (
+    <button
+      type="button"
+      onClick={toggleSubtitles}
+      className="btn-secondary px-3 py-2 text-xs"
+      title={showSubtitles ? "Hide subtitles" : "Show subtitles"}
+    >
+      {showSubtitles ? <Captions size={14} /> : <CaptionsOff size={14} />}
+      {showSubtitles ? "Subtitles on" : "Subtitles off"}
+    </button>
+  ) : null;
+
   const handlePlay = () => {
     if (isHandlingRemote.current) return;
     if (!isHost) {
@@ -448,6 +526,10 @@ const VideoPlayer = forwardRef<VideoPlayerRef, VideoPlayerProps>(({ roomId, isFu
   };
 
   const [erroredUrl, setErroredUrl] = useState<string | null>(null);
+  const erroredUrlRef = useRef<string | null>(null);
+  useEffect(() => {
+    erroredUrlRef.current = erroredUrl;
+  }, [erroredUrl]);
   const videoError = !!url && erroredUrl === url;
   const setVideoError = (failed: boolean) => setErroredUrl(failed ? urlRef.current : null);
 
@@ -543,6 +625,23 @@ const VideoPlayer = forwardRef<VideoPlayerRef, VideoPlayerProps>(({ roomId, isFu
               <span className="flex-1">Play a local video file</span>
               <input type="file" accept="video/*" onChange={handleLocalFile} className="sr-only" />
             </label>
+            <div className="flex items-center gap-2">
+              <label className="flex flex-1 cursor-pointer items-center gap-2 rounded-lg border border-dashed border-white/15 px-3 py-2 text-xs text-slate-300 transition-colors hover:border-indigo-400/50 hover:bg-white/[0.03]">
+                <FileText size={14} className="text-indigo-300" />
+                <span className="flex-1 truncate">{subtitles ? `Subtitles: ${subtitles.label}` : "Load subtitles (.srt / .vtt)"}</span>
+                <input type="file" accept=".srt,.vtt,text/vtt" onChange={handleSubtitleFile} className="sr-only" />
+              </label>
+              {subtitles && (
+                <>
+                  <button type="button" onClick={toggleSubtitles} className="btn-ghost p-2" title={showSubtitles ? "Hide subtitles" : "Show subtitles"} aria-label="Toggle subtitles">
+                    {showSubtitles ? <Captions size={14} /> : <CaptionsOff size={14} />}
+                  </button>
+                  <button type="button" onClick={() => socket?.emit("subtitles_clear", { roomId })} className="btn-ghost p-2 hover:text-red-300" title="Remove subtitles" aria-label="Remove subtitles">
+                    <X size={14} />
+                  </button>
+                </>
+              )}
+            </div>
             <div className="flex items-center gap-2 border-t border-white/5 pt-2.5">
               {shareScreen && (
                 <button onClick={shareScreen} className="btn-secondary flex-1 px-3 py-2 text-xs">
@@ -555,13 +654,16 @@ const VideoPlayer = forwardRef<VideoPlayerRef, VideoPlayerProps>(({ roomId, isFu
             </div>
           </div>
         ) : (
-          <button
-            onClick={() => socket?.emit("request_sync", { roomId })}
-            className="btn-primary px-4 py-2 text-sm"
-          >
-            <RefreshCcw size={15} />
-            Sync with host
-          </button>
+          <div className="flex items-center gap-2">
+            {subtitleToggle}
+            <button
+              onClick={() => socket?.emit("request_sync", { roomId })}
+              className="btn-primary px-4 py-2 text-sm"
+            >
+              <RefreshCcw size={15} />
+              Sync with host
+            </button>
+          </div>
         )}
         {videoError && (
           <div className="mt-2 w-full rounded-lg border border-red-500/30 bg-red-950/80 p-2 text-right text-xs font-medium text-red-300">
@@ -587,6 +689,8 @@ const VideoPlayer = forwardRef<VideoPlayerRef, VideoPlayerProps>(({ roomId, isFu
             onProgress={handleProgress}
             onError={() => setVideoError(true)}
             onEnded={handleEnded}
+            onBuffer={handleBuffer}
+            onBufferEnd={handleBufferEnd}
             controls={true}
             config={{ youtube: { playerVars: { fs: 0 } } }}
             style={{ position: "absolute", top: 0, left: 0 }}
@@ -599,6 +703,9 @@ const VideoPlayer = forwardRef<VideoPlayerRef, VideoPlayerProps>(({ roomId, isFu
             <p className="font-medium text-slate-300">{isHost ? "Nothing playing yet" : "Waiting for the host to play something"}</p>
             <p className="mt-1 text-sm">{isHost ? "Hover here and paste a video link to get started." : "Grab a snack — it'll start for everyone at once."}</p>
           </div>
+        )}
+        {url && subtitles && showSubtitles && (
+          <SubtitleOverlay vtt={subtitles.vtt} getCurrentTime={readCurrentTime} isFullscreen={isFullscreen} />
         )}
       </div>
     </div>

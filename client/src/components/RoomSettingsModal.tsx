@@ -1,5 +1,6 @@
-import { useState } from "react";
-import { Globe2, Lock } from "lucide-react";
+import { useEffect, useState } from "react";
+import { Globe2, Lock, UserCheck } from "lucide-react";
+import Avatar from "./ui/Avatar";
 import Modal from "./ui/Modal";
 import PasswordInput from "./PasswordInput";
 import Spinner from "./ui/Spinner";
@@ -26,6 +27,33 @@ export default function RoomSettingsModal({ isOpen, onClose, roomId, initial, on
   const [password, setPassword] = useState("");
   const [maxParticipants, setMaxParticipants] = useState(initial.maxParticipants);
   const [isSaving, setIsSaving] = useState(false);
+  const [bans, setBans] = useState<{ user: { id: string; name: string; email: string } }[] | null>(null);
+
+  useEffect(() => {
+    if (!isOpen) return;
+    let cancelled = false;
+    api
+      .get(`/rooms/${roomId}/bans`)
+      .then((res) => {
+        if (!cancelled) setBans(res.data.bans);
+      })
+      .catch(() => {
+        if (!cancelled) setBans([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [isOpen, roomId]);
+
+  const allowBack = async (userId: string, userName: string) => {
+    try {
+      await api.delete(`/rooms/${roomId}/bans/${userId}`);
+      setBans((list) => list?.filter((b) => b.user.id !== userId) ?? null);
+      toast.success(`${userName} can rejoin this room`);
+    } catch (error) {
+      toast.error(getErrorMessage(error, "Couldn't update removed participants"));
+    }
+  };
 
   const needsPassword = isPrivate && !initial.isPrivate && !password.trim();
 
@@ -106,6 +134,25 @@ export default function RoomSettingsModal({ isOpen, onClose, roomId, initial, on
             className="w-full accent-indigo-500"
           />
         </div>
+
+        {bans && bans.length > 0 && (
+          <div>
+            <span className="label">Removed participants</span>
+            <div className="max-h-40 space-y-1.5 overflow-y-auto pr-1">
+              {bans.map(({ user }) => (
+                <div key={user.id} className="flex items-center justify-between gap-3 rounded-lg bg-white/[0.03] p-2">
+                  <div className="flex min-w-0 items-center gap-2">
+                    <Avatar name={user.name} seed={user.id} size={26} />
+                    <span className="truncate text-sm text-slate-200">{user.name}</span>
+                  </div>
+                  <button type="button" onClick={() => allowBack(user.id, user.name)} className="btn-secondary px-2.5 py-1 text-xs">
+                    <UserCheck size={13} /> Allow back
+                  </button>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
 
         <div className="flex gap-2">
           <button type="button" onClick={onClose} className="btn-secondary flex-1">Cancel</button>

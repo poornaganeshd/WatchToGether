@@ -2,6 +2,7 @@ import { create } from 'zustand';
 import { io, Socket } from 'socket.io-client';
 import { useAuthStore } from './useAuthStore';
 import { toast } from './useToastStore';
+import { rememberAvatars } from './useAvatarStore';
 
 export interface Message {
   id: string;
@@ -22,7 +23,21 @@ export interface Participant {
   socketId: string;
   userId: string;
   userName: string;
+  avatarVersion?: number | null;
 }
+
+export interface Subtitles {
+  label: string;
+  vtt: string;
+}
+
+export interface SkipVotes {
+  count: number;
+  needed: number;
+  voters: string[];
+}
+
+export type SyncState = 'synced' | 'drifting' | 'buffering' | 'error';
 
 export interface Reaction {
   key: string;
@@ -62,6 +77,9 @@ interface SocketState {
   queue: QueueItem[];
   typingUsers: Record<string, string>; // socketId -> name
   roomInfo: RoomInfoUpdate | null;
+  subtitles: Subtitles | null;
+  skipVotes: SkipVotes;
+  viewerSync: Record<string, { state: SyncState; drift: number }>;
   currentRoomSession: RoomSession | null;
   connect: () => void;
   disconnect: () => void;
@@ -107,6 +125,9 @@ export const useSocketStore = create<SocketState>((set, get) => ({
   queue: [],
   typingUsers: {},
   roomInfo: null,
+  subtitles: null,
+  skipVotes: { count: 0, needed: 1, voters: [] },
+  viewerSync: {},
   currentRoomSession: null,
 
   connect: () => {
@@ -166,20 +187,44 @@ export const useSocketStore = create<SocketState>((set, get) => ({
       });
 
       socket.on('room_participants', (list: Participant[]) => {
+        rememberAvatars(Object.fromEntries(list.map((p) => [p.userId, p.avatarVersion])));
         set({ participants: Object.fromEntries(list.map((p) => [p.socketId, p])) });
       });
 
-      socket.on('user_joined', ({ socketId, userId, userName }: Participant) => {
-        set((state) => ({ participants: { ...state.participants, [socketId]: { socketId, userId, userName } } }));
+      socket.on('user_joined', ({ socketId, userId, userName, avatarVersion }: Participant) => {
+        rememberAvatars({ [userId]: avatarVersion });
+        set((state) => ({ participants: { ...state.participants, [socketId]: { socketId, userId, userName, avatarVersion } } }));
+      });
+
+      socket.on('subtitles_updated', (subtitles: Subtitles | null) => {
+        set({ subtitles });
+      });
+
+      socket.on('skip_votes', (skipVotes: SkipVotes) => {
+        set({ skipVotes });
+      });
+
+      socket.on('skip_passed', () => {
+        toast.info("The room voted to skip — playing the next video.");
+      });
+
+      socket.on('viewer_sync', ({ socketId, state, drift }: { socketId: string; state: SyncState; drift: number }) => {
+        set((s) => ({ viewerSync: { ...s.viewerSync, [socketId]: { state, drift } } }));
+      });
+
+      socket.on('viewer_sync_all', (reports: Record<string, { state: SyncState; drift: number }>) => {
+        set({ viewerSync: reports });
       });
 
       socket.on('user_left', ({ socketId }: { socketId: string }) => {
         set((state) => {
           const typingUsers = dropTyping(state.typingUsers, socketId);
-          if (!state.participants[socketId]) return { typingUsers };
+          const viewerSync = { ...state.viewerSync };
+          delete viewerSync[socketId];
+          if (!state.participants[socketId]) return { typingUsers, viewerSync };
           const next = { ...state.participants };
           delete next[socketId];
-          return { participants: next, typingUsers };
+          return { participants: next, typingUsers, viewerSync };
         });
       });
 
@@ -237,7 +282,13 @@ export const useSocketStore = create<SocketState>((set, get) => ({
           set({ exitReason: 'kicked', currentRoomSession: null });
         } else if (errorMsg.includes("Room is full")) {
           set({ exitReason: 'full', currentRoomSession: null });
-        } else if (errorMsg.includes("Only the host") || errorMsg.includes("queue is full") || errorMsg.includes("too quickly")) {
+        } else if (
+          errorMsg.includes("Only the host") ||
+          errorMsg.includes("queue is full") ||
+          errorMsg.includes("too quickly") ||
+          errorMsg.includes("Nothing is queued") ||
+          errorMsg.includes("Subtitle file")
+        ) {
           toast.error(errorMsg);
         } else if (errorMsg.includes("Incorrect password")) {
           set({ roomAccessError: 'incorrect_password' });
@@ -279,7 +330,7 @@ export const useSocketStore = create<SocketState>((set, get) => ({
   },
 
   leaveRoom: (roomId, userId, userName) => {
-    set({ currentRoomSession: null, reconnectError: null, roomAccessError: null, participants: {}, reactions: [], queue: [], typingUsers: {}, roomInfo: null });
+    set({ currentRoomSession: null, reconnectError: null, roomAccessError: null, participants: {}, reactions: [], queue: [], typingUsers: {}, roomInfo: null, subtitles: null, skipVotes: { count: 0, needed: 1, voters: [] }, viewerSync: {} });
     const { socket } = get();
     if (socket) {
       socket.emit('leave_room', { roomId, userId, userName });

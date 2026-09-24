@@ -18,6 +18,7 @@ import ChatPanel from "../components/ChatPanel";
 import PasswordPrompt from "../components/PasswordPrompt";
 import { ReactionOverlay, ReactionPicker } from "../components/Reactions";
 import { toast } from "../store/useToastStore";
+import { loadIceServers } from "../lib/ice";
 import { copyToClipboard, formatClock } from "../lib/format";
 import type { VideoPlayerRef } from "../components/VideoPlayer";
 
@@ -140,7 +141,8 @@ export default function Room() {
       return;
     }
     mediaStartedRef.current = true;
-    getLocalStream().then(() => {
+    // Fetch TURN credentials alongside media so the first peer connections can use them.
+    Promise.all([getLocalStream(), loadIceServers()]).then(() => {
       joinRoom(id, user.id, user.name, password);
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -753,7 +755,7 @@ export default function Room() {
           onClose={() => setIsChatOpen(false)}
           onMakeCoHost={(targetSocketId) => socket?.emit("make_cohost", { roomId: id, targetSocketId })}
           onKick={(targetSocketId, name) => {
-            if (confirm(`Remove ${name} from this room? They won't be able to rejoin this session.`)) {
+            if (confirm(`Remove ${name} from this room? They can't rejoin until you allow them back in room settings.`)) {
               socket?.emit("kick_participant", { roomId: id, targetSocketId });
             }
           }}

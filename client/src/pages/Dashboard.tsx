@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 import {
-  Check, Copy, Crown, Globe2, History, KeyRound, Lock, LogIn, LogOut, MonitorPlay, Plus, RefreshCw, Search,
+  CalendarClock, CalendarPlus, Check, Copy, Crown, Settings as SettingsIcon, Globe2, History, KeyRound, Lock, LogIn, LogOut, MonitorPlay, Plus, RefreshCw, Search,
   Trash2, UserMinus, UserPlus, Users, X,
 } from "lucide-react";
 import api, { getErrorMessage } from "../lib/api";
@@ -13,12 +13,16 @@ import Logo from "../components/ui/Logo";
 import Avatar from "../components/ui/Avatar";
 import Spinner from "../components/ui/Spinner";
 import PasswordInput from "../components/PasswordInput";
+import { rememberAvatars } from "../store/useAvatarStore";
+import { countdown, downloadCalendarEvent, toLocalInputValue } from "../lib/calendar";
 
 interface Friend {
   id: string;
   status: "PENDING" | "ACCEPTED";
   isSender: boolean;
-  user: { id: string; name: string; email: string };
+  user: { id: string; name: string; email: string; avatarVersion?: number | null };
+  online?: boolean;
+  room?: { id: string; name: string; displayId: string | null; isPrivate: boolean } | null;
 }
 
 interface RoomSummary {
@@ -33,10 +37,11 @@ interface RoomSummary {
   createdAt: string;
   visitedAt?: string;
   maxParticipants?: number;
+  scheduledFor?: string | null;
   _count?: { participants: number };
 }
 
-type Tab = "live" | "friends" | "history";
+type Tab = "live" | "upcoming" | "friends" | "history";
 
 export default function Dashboard() {
   const { user, logout } = useAuthStore();
@@ -47,12 +52,16 @@ export default function Dashboard() {
   const [friends, setFriends] = useState<Friend[]>([]);
   const [publicRooms, setPublicRooms] = useState<RoomSummary[]>([]);
   const [roomHistory, setRoomHistory] = useState<RoomSummary[]>([]);
-  const [loading, setLoading] = useState({ live: true, friends: true, history: true });
+  const [loading, setLoading] = useState({ live: true, friends: true, history: true, upcoming: true });
 
   const [roomName, setRoomName] = useState("");
   const [isPrivate, setIsPrivate] = useState(true);
   const [createPassword, setCreatePassword] = useState("");
   const [isCreating, setIsCreating] = useState(false);
+  const [scheduleLater, setScheduleLater] = useState(false);
+  const [scheduleAt, setScheduleAt] = useState(() => toLocalInputValue(new Date(Date.now() + 60 * 60 * 1000)));
+  const [upcomingRooms, setUpcomingRooms] = useState<RoomSummary[]>([]);
+  const [now, setNow] = useState(() => Date.now());
 
   const [joinCode, setJoinCode] = useState("");
   const [joinPassword, setJoinPassword] = useState("");
@@ -67,7 +76,9 @@ export default function Dashboard() {
   const fetchFriends = useCallback(async () => {
     try {
       const res = await api.get("/friends");
-      setFriends(res.data.friends);
+      const list: Friend[] = res.data.friends;
+      rememberAvatars(Object.fromEntries(list.map((f) => [f.user.id, f.user.avatarVersion])));
+      setFriends(list);
     } catch (error) {
       console.error("Failed to fetch friends:", error);
     } finally {
@@ -83,6 +94,17 @@ export default function Dashboard() {
       console.error("Failed to fetch history:", error);
     } finally {
       setLoading((l) => ({ ...l, history: false }));
+    }
+  }, []);
+
+  const fetchUpcoming = useCallback(async () => {
+    try {
+      const res = await api.get("/rooms/upcoming");
+      setUpcomingRooms(res.data.rooms);
+    } catch (error) {
+      console.error("Failed to fetch upcoming rooms:", error);
+    } finally {
+      setLoading((l) => ({ ...l, upcoming: false }));
     }
   }, []);
 
@@ -109,8 +131,15 @@ export default function Dashboard() {
     fetchFriends();
     fetchHistory();
     fetchPublicRooms();
+    fetchUpcoming();
     connect();
-  }, [user, connect, fetchFriends, fetchHistory, fetchPublicRooms]);
+  }, [user, connect, fetchFriends, fetchHistory, fetchPublicRooms, fetchUpcoming]);
+
+  // Countdowns and friend presence stay fresh without a full reload.
+  useEffect(() => {
+    const interval = setInterval(() => setNow(Date.now()), 30000);
+    return () => clearInterval(interval);
+  }, []);
 
   // Keep the live room list fresh while the dashboard is open.
   useEffect(() => {
@@ -126,13 +155,28 @@ export default function Dashboard() {
     joinGlobal();
     socket.on("connect", joinGlobal);
 
-    const handleNotification = (data: { title: string; body: string; roomId?: string }) => {
+    let presenceTimer: ReturnType<typeof setTimeout> | null = null;
+    const handlePresence = () => {
+      // Several friends can change at once; batch into one refetch.
+      if (presenceTimer) clearTimeout(presenceTimer);
+      presenceTimer = setTimeout(fetchFriends, 400);
+    };
+    socket.on("presence_changed", handlePresence);
+
+    const handleNotification = (data: { title: string; body: string; roomId?: string; scheduledFor?: string }) => {
+      if (data.scheduledFor) {
+        fetchUpcoming();
+      }
       if (data.title.toLowerCase().includes("friend")) {
         fetchFriends();
       }
       toast.info(
         data.body,
-        data.roomId ? { label: "Join room", onClick: () => navigate(`/room/${data.roomId}`) } : undefined
+        data.roomId
+          ? data.scheduledFor
+            ? { label: "See upcoming", onClick: () => setActiveTab("upcoming") }
+            : { label: "Join room", onClick: () => navigate(`/room/${data.roomId}`) }
+          : undefined
       );
       if ("Notification" in window && Notification.permission === "granted" && document.hidden) {
         const n = new Notification(data.title, { body: data.body, icon: "/favicon.svg" });
@@ -149,14 +193,19 @@ export default function Dashboard() {
     return () => {
       socket.off("connect", joinGlobal);
       socket.off("notification", handleNotification);
+      socket.off("presence_changed", handlePresence);
+      if (presenceTimer) clearTimeout(presenceTimer);
     };
-  }, [socket, user, navigate, fetchFriends]);
+  }, [socket, user, navigate, fetchFriends, fetchUpcoming]);
 
   if (!user) return null;
 
   const incomingRequests = friends.filter((f) => f.status === "PENDING" && !f.isSender);
   const outgoingRequests = friends.filter((f) => f.status === "PENDING" && f.isSender);
-  const acceptedFriends = friends.filter((f) => f.status === "ACCEPTED");
+  const acceptedFriends = friends
+    .filter((f) => f.status === "ACCEPTED")
+    .sort((a, b) => Number(!!b.room) - Number(!!a.room) || Number(!!b.online) - Number(!!a.online) || a.user.name.localeCompare(b.user.name));
+  const friendsWatching = acceptedFriends.filter((f) => f.room);
   const filteredHistory = roomHistory.filter((r) => {
     const q = historyFilter.trim().toLowerCase();
     return !q || r.name.toLowerCase().includes(q) || (r.displayId ?? "").toLowerCase().includes(q) || r.host.name.toLowerCase().includes(q);
@@ -178,13 +227,33 @@ export default function Dashboard() {
       toast.error("Private rooms need a password");
       return;
     }
+    let scheduledFor: string | undefined;
+    if (scheduleLater) {
+      const when = new Date(scheduleAt);
+      if (Number.isNaN(when.getTime()) || when.getTime() <= Date.now()) {
+        toast.error("Pick a start time in the future");
+        return;
+      }
+      scheduledFor = when.toISOString();
+    }
     setIsCreating(true);
     try {
       const res = await api.post("/rooms", {
         name: roomName.trim(),
         isPrivate,
         password: isPrivate ? createPassword : undefined,
+        scheduledFor,
       });
+      if (scheduledFor) {
+        toast.success("Watch party scheduled — your friends have been notified.");
+        setRoomName("");
+        setCreatePassword("");
+        setScheduleLater(false);
+        setIsCreating(false);
+        setActiveTab("upcoming");
+        fetchUpcoming();
+        return;
+      }
       navigate(`/room/${res.data.room.id}`);
     } catch (error) {
       toast.error(getErrorMessage(error, "Failed to create room"));
@@ -289,6 +358,7 @@ export default function Dashboard() {
   const tabs: { id: Tab; label: string; icon: typeof Globe2; badge?: number }[] = [
     { id: "live", label: "Live now", icon: Globe2, badge: publicRooms.length || undefined },
     { id: "friends", label: "Friends", icon: Users, badge: incomingRequests.length || undefined },
+    { id: "upcoming", label: "Upcoming", icon: CalendarClock, badge: upcomingRooms.filter((r) => r.scheduledFor && new Date(r.scheduledFor).getTime() > now).length || undefined },
     { id: "history", label: "History", icon: History },
   ];
 
@@ -306,7 +376,12 @@ export default function Dashboard() {
               <p className="text-sm font-medium text-white">{user.name}</p>
               <p className="text-xs text-slate-500">{user.email}</p>
             </div>
-            <Avatar name={user.name} seed={user.id} size={36} />
+            <Link to="/settings" className="rounded-full" title="Profile & settings" aria-label="Profile and settings">
+              <Avatar name={user.name} seed={user.id} version={user.avatarVersion ?? null} size={36} />
+            </Link>
+            <Link to="/settings" className="btn-ghost px-2.5" title="Settings" aria-label="Settings">
+              <SettingsIcon size={18} />
+            </Link>
             <button onClick={logout} className="btn-ghost px-2.5" title="Sign out" aria-label="Sign out">
               <LogOut size={18} />
             </button>
@@ -372,8 +447,23 @@ export default function Dashboard() {
               ) : (
                 <p className="px-1 text-xs text-slate-400">Public rooms appear under “Live now” for everyone.</p>
               )}
+              <label className="flex cursor-pointer items-center gap-2 px-1 text-sm text-slate-300">
+                <input type="checkbox" checked={scheduleLater} onChange={(e) => setScheduleLater(e.target.checked)} className="h-4 w-4 rounded accent-indigo-500" />
+                <CalendarClock size={14} className="text-indigo-300" /> Schedule for later
+              </label>
+              {scheduleLater && (
+                <input
+                  type="datetime-local"
+                  value={scheduleAt}
+                  min={toLocalInputValue(new Date())}
+                  onChange={(e) => setScheduleAt(e.target.value)}
+                  className="input animate-fade-up [color-scheme:dark]"
+                  aria-label="Start time"
+                />
+              )}
               <button type="submit" disabled={isCreating || !roomName.trim()} className="btn-primary w-full">
-                {isCreating ? <Spinner className="h-4 w-4" /> : <MonitorPlay size={16} />} Create room
+                {isCreating ? <Spinner className="h-4 w-4" /> : scheduleLater ? <CalendarClock size={16} /> : <MonitorPlay size={16} />}
+                {scheduleLater ? "Schedule watch party" : "Create room"}
               </button>
             </div>
           </form>
@@ -427,6 +517,7 @@ export default function Dashboard() {
                 if (id === "history") fetchHistory();
                 if (id === "live") fetchPublicRooms();
                 if (id === "friends") fetchFriends();
+                if (id === "upcoming") fetchUpcoming();
               }}
               className={`flex items-center gap-2 whitespace-nowrap rounded-lg px-4 py-2 text-sm font-medium transition-colors ${
                 activeTab === id ? "bg-white/10 text-white" : "text-slate-400 hover:text-slate-200"
@@ -444,6 +535,29 @@ export default function Dashboard() {
 
         {activeTab === "live" && (
           <section className="animate-fade-in">
+            {friendsWatching.length > 0 && (
+              <div className="mb-6">
+                <h3 className="mb-3 text-xs font-semibold uppercase tracking-wide text-fuchsia-300">Friends watching now</h3>
+                <div className="flex gap-3 overflow-x-auto pb-1">
+                  {friendsWatching.map((f) => (
+                    <button
+                      key={f.id}
+                      onClick={() => navigate(`/room/${f.room!.id}`)}
+                      className="card flex min-w-[15rem] items-center gap-3 p-3 text-left transition-colors hover:border-fuchsia-400/30 hover:bg-white/[0.05]"
+                    >
+                      <Avatar name={f.user.name} seed={f.user.id} version={f.user.avatarVersion} size={40} online />
+                      <div className="min-w-0 flex-1">
+                        <p className="truncate text-sm font-medium text-white">{f.user.name}</p>
+                        <p className="flex items-center gap-1 truncate text-xs text-slate-400">
+                          {f.room!.isPrivate && <Lock size={11} />} {f.room!.name}
+                        </p>
+                      </div>
+                      <span className="chip border-fuchsia-400/30 bg-fuchsia-500/10 text-fuchsia-200">Join</span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
             <div className="mb-4 flex items-center justify-between">
               <p className="text-sm text-slate-400">Public rooms that are open right now.</p>
               <button onClick={fetchPublicRooms} className="btn-ghost px-2.5 py-1.5 text-xs">
@@ -532,7 +646,12 @@ export default function Dashboard() {
                 ) : (
                   <div className="space-y-2">
                     {acceptedFriends.map((friend) => (
-                      <FriendRow key={friend.id} friend={friend}>
+                      <FriendRow key={friend.id} friend={friend} showPresence>
+                        {friend.room && (
+                          <button onClick={() => navigate(`/room/${friend.room!.id}`)} className="btn-primary px-3 py-1.5 text-xs" title={`Join ${friend.room.name}`}>
+                            <LogIn size={14} /> Join
+                          </button>
+                        )}
                         <button onClick={() => handleRemoveFriend(friend, "Friend removed")} className="btn-ghost px-2 py-1.5 text-slate-500 hover:text-red-300" title="Remove friend" aria-label="Remove friend">
                           <UserMinus size={16} />
                         </button>
@@ -550,6 +669,63 @@ export default function Dashboard() {
                 )}
               </div>
             </div>
+          </section>
+        )}
+
+        {activeTab === "upcoming" && (
+          <section className="animate-fade-in">
+            <p className="mb-4 text-sm text-slate-400">Watch parties scheduled by you and your friends.</p>
+            {loading.upcoming ? (
+              <SkeletonGrid />
+            ) : upcomingRooms.length === 0 ? (
+              <EmptyState icon={CalendarClock} title="Nothing scheduled" body="Tick “Schedule for later” when creating a room and your friends will be notified." />
+            ) : (
+              <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+                {upcomingRooms.map((room) => {
+                  const start = new Date(room.scheduledFor!);
+                  const isHostRoom = room.hostId === user.id;
+                  const soon = start.getTime() - now < 15 * 60_000;
+                  return (
+                    <div key={room.id} className="card flex flex-col p-5">
+                      <div className="mb-3 flex items-center justify-between">
+                        <span className={`chip ${soon ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-300" : "border-indigo-400/30 bg-indigo-500/10 text-indigo-200"}`}>
+                          <CalendarClock size={12} /> {countdown(start, now)}
+                        </span>
+                        {room.isPrivate && <Lock size={13} className="text-slate-500" aria-label="Private" />}
+                      </div>
+                      <h3 className="truncate font-display text-lg font-semibold text-white">{room.name}</h3>
+                      <p className="mt-1 text-sm text-slate-300">
+                        {start.toLocaleString(undefined, { weekday: "short", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })}
+                      </p>
+                      <p className="mt-2 flex items-center gap-2 text-xs text-slate-400">
+                        <Avatar name={room.host.name} seed={room.hostId} size={20} /> {isHostRoom ? "Hosted by you" : room.host.name}
+                      </p>
+                      <div className="mt-4 flex gap-2">
+                        <button onClick={() => navigate(`/room/${room.id}`)} className={`${soon ? "btn-primary" : "btn-secondary"} flex-1 py-2 text-xs`}>
+                          {soon ? "Join now" : "Open room"}
+                        </button>
+                        <button
+                          onClick={() =>
+                            downloadCalendarEvent({
+                              id: room.id,
+                              title: `Watch party: ${room.name}`,
+                              start,
+                              url: `${window.location.origin}/room/${room.id}`,
+                              description: `${room.host.name} is hosting on WatchTogether${room.displayId ? ` (code ${room.displayId})` : ""}. Join: ${window.location.origin}/room/${room.id}`,
+                            })
+                          }
+                          className="btn-secondary px-3 py-2 text-xs"
+                          title="Add to calendar"
+                          aria-label="Add to calendar"
+                        >
+                          <CalendarPlus size={14} />
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
           </section>
         )}
 
@@ -638,14 +814,22 @@ export default function Dashboard() {
   );
 }
 
-function FriendRow({ friend, children }: { friend: Friend; children: React.ReactNode }) {
+function FriendRow({ friend, children, showPresence = false }: { friend: Friend; children: React.ReactNode; showPresence?: boolean }) {
   return (
     <div className="flex items-center justify-between gap-3 rounded-xl border border-white/5 bg-ink-900/50 p-3">
       <div className="flex min-w-0 items-center gap-3">
-        <Avatar name={friend.user.name} seed={friend.user.id} />
+        <Avatar name={friend.user.name} seed={friend.user.id} version={friend.user.avatarVersion} online={showPresence ? !!friend.online : undefined} />
         <div className="min-w-0">
           <p className="truncate text-sm font-medium text-white">{friend.user.name}</p>
-          <p className="truncate text-xs text-slate-500">{friend.user.email}</p>
+          <p className="truncate text-xs text-slate-500">
+            {showPresence && friend.room ? (
+              <span className="text-fuchsia-300">Watching {friend.room.name}</span>
+            ) : showPresence && friend.online ? (
+              <span className="text-emerald-300">Online</span>
+            ) : (
+              friend.user.email
+            )}
+          </p>
         </div>
       </div>
       <div className="flex shrink-0 items-center gap-1.5">{children}</div>

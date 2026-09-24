@@ -1,31 +1,12 @@
 import { useEffect, useRef, useState } from "react";
 import { useSocketStore } from "../store/useSocketStore";
 import { useAuthStore } from "../store/useAuthStore";
+import { getIceServers } from "../lib/ice";
 import { classifyRemoteStream, type StreamStateContext } from "../utils/streamClassification";
 
 interface PeerConnection {
   [socketId: string]: RTCPeerConnection;
 }
-
-const DEFAULT_ICE_SERVERS: RTCIceServer[] = [
-  { urls: "stun:stun.l.google.com:19302" },
-  { urls: "stun:stun1.l.google.com:19302" },
-];
-
-// STUN alone fails behind symmetric NATs and many corporate/mobile networks, so allow
-// a TURN server to be configured, e.g.
-// VITE_ICE_SERVERS='[{"urls":"turn:turn.example.com:3478","username":"u","credential":"p"}]'
-const ICE_SERVERS: RTCIceServer[] = (() => {
-  const raw = import.meta.env.VITE_ICE_SERVERS;
-  if (!raw) return DEFAULT_ICE_SERVERS;
-  try {
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) && parsed.length > 0 ? parsed : DEFAULT_ICE_SERVERS;
-  } catch {
-    console.warn("VITE_ICE_SERVERS is not valid JSON; falling back to public STUN servers");
-    return DEFAULT_ICE_SERVERS;
-  }
-})();
 
 // Match senders by their transceiver's media kind. A sender whose track was replaced with null
 // could otherwise be an audio *or* video slot.
@@ -161,7 +142,7 @@ export function useWebRTC(roomId: string) {
     if (!socket || !user) return;
 
     const createPeerConnection = (peerSocketId: string, stream: MediaStream) => {
-      const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+      const pc = new RTCPeerConnection({ iceServers: getIceServers() });
 
       pc.onicecandidate = (event) => {
         if (!isMounted || pc.signalingState === "closed") return;

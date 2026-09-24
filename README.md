@@ -18,6 +18,14 @@ Watch videos in sync with friends, with video/voice chat, live chat and emoji re
 - Typing indicators, keyboard shortcuts (press `?` in a room)
 - Host & co-host roles with automatic host migration; hosts can remove participants and edit room settings (name, privacy, password, capacity)
 - Viewers without a camera or microphone can still join and see/hear everyone
+- Shared subtitles (.srt / .vtt) rendered over any player, including YouTube
+- Vote to skip (majority of the room) and a persisted watch queue
+- Live sync status per viewer (in sync / behind / buffering / can't play) for hosts
+- Friends presence: see who's online and which room they're in, with one-click join
+- Scheduled watch parties with friend notifications, countdowns and calendar (.ics) export
+- Profiles with display name and avatar upload; password change signs out other sessions
+- Password reset by email; rate limiting on sign-in, sign-up and reset
+- TURN support: the API issues short-lived credentials (see `docker compose --profile turn`)
 
 ## Getting started
 
@@ -43,7 +51,7 @@ npm run dev                     # http://localhost:5173
 | Variable | Purpose |
 | --- | --- |
 | `VITE_API_URL` | API origin (default `http://localhost:5000`) |
-| `VITE_ICE_SERVERS` | Optional JSON array of WebRTC ICE servers. Add a TURN server so calls work behind strict NATs, e.g. `[{"urls":"turn:turn.example.com:3478","username":"u","credential":"p"}]` |
+| `VITE_ICE_SERVERS` | Optional JSON array of ICE servers that overrides what the API provides. Prefer server-side `TURN_*` settings so credentials rotate |
 
 ### Server environment
 
@@ -52,7 +60,18 @@ npm run dev                     # http://localhost:5173
 | `DATABASE_URL`, `DIRECT_URL` | PostgreSQL connection strings |
 | `JWT_SECRET` | Secret used to sign auth tokens (required) |
 | `CLIENT_URL` | Public client URL, used for invite links and CORS (comma-separate multiple origins) |
-| `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`, `SMTP_FROM` | Optional: email invitations. In-app invites work without them |
+| `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`, `SMTP_FROM` | Email invitations and password reset. Without SMTP, reset links are printed to the server log in development |
+| `TURN_URLS`, `TURN_SECRET` | TURN relay for WebRTC. With a shared secret (coturn `use-auth-secret`) the API hands out 12-hour credentials. `TURN_USERNAME`/`TURN_CREDENTIAL` work for static credentials |
+| `TRUST_PROXY` | Set (e.g. `1`) behind a reverse proxy so rate limits see real client IPs |
+
+### TURN relay
+
+Some networks (symmetric NAT, many corporate and mobile networks) block direct peer connections. Run coturn with the bundled profile and point the API at it:
+
+```bash
+TURN_SECRET=$(openssl rand -hex 32) EXTERNAL_IP=<public ip> docker compose --profile turn up -d
+# API: TURN_URLS=turn:<public host>:3478 TURN_SECRET=<same secret>
+```
 
 ## Tests
 

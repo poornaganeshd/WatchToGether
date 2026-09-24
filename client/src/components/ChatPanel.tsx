@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
-import { ArrowDown, ChevronDown, ChevronRight, ChevronUp, Clock, Crown, ListVideo, MessageSquare, Mic2, Play, Plus, SendHorizonal, Settings, Share2, Shield, Users, UserX, X } from "lucide-react";
+import { ArrowDown, ChevronDown, ChevronRight, ChevronUp, Clock, Crown, ListVideo, MessageSquare, Mic2, Play, Plus, SendHorizonal, Settings, Share2, Shield, SkipForward, Users, UserX, X } from "lucide-react";
 import { useSocketStore, type Message, type QueueItem } from "../store/useSocketStore";
 import Avatar from "./ui/Avatar";
 
@@ -51,6 +51,8 @@ export default function ChatPanel({
   const setTyping = useSocketStore((s) => s.setTyping);
   const typingUsers = useSocketStore((s) => s.typingUsers);
   const queue = useSocketStore((s) => s.queue);
+  const skipVotes = useSocketStore((s) => s.skipVotes);
+  const viewerSync = useSocketStore((s) => s.viewerSync);
   const socket = useSocketStore((s) => s.socket);
   const [tab, setTab] = useState<"chat" | "queue" | "people">("chat");
   const [queueUrl, setQueueUrl] = useState("");
@@ -308,6 +310,29 @@ export default function ChatPanel({
               <Plus size={16} />
             </button>
           </form>
+          {queue.length > 0 && (
+            <div className="flex items-center justify-between gap-2 border-b border-white/5 px-3 py-2">
+              <div className="text-xs text-slate-400">
+                <span className="font-semibold text-slate-200">{skipVotes.count}</span> of {skipVotes.needed} votes to skip
+                <div className="mt-1 h-1 w-32 overflow-hidden rounded-full bg-white/10">
+                  <div className="h-full rounded-full bg-gradient-to-r from-indigo-400 to-fuchsia-400 transition-all" style={{ width: `${Math.min(100, (skipVotes.count / Math.max(1, skipVotes.needed)) * 100)}%` }} />
+                </div>
+              </div>
+              {(() => {
+                const voted = skipVotes.voters.includes(currentUser.id);
+                return (
+                  <button
+                    onClick={() => socket?.emit("vote_skip", { roomId })}
+                    className={`${voted ? "btn-primary" : "btn-secondary"} px-3 py-1.5 text-xs`}
+                    aria-pressed={voted}
+                    title={voted ? "Withdraw your vote" : "Vote to skip to the next video"}
+                  >
+                    <SkipForward size={14} /> {voted ? "Voted" : "Vote skip"}
+                  </button>
+                );
+              })()}
+            </div>
+          )}
           <div className="flex-1 space-y-2 overflow-y-auto p-3">
             {queue.length === 0 ? (
               <div className="flex h-full flex-col items-center justify-center text-center text-slate-500">
@@ -366,7 +391,10 @@ export default function ChatPanel({
                     {p.userName}
                     {p.userId === currentUser.id && <span className="ml-1 text-slate-500">(you)</span>}
                   </p>
-                  <p className="text-xs text-slate-500">{isRoomHost ? "Host" : isCo ? "Co-host" : "Viewer"}</p>
+                  <p className="flex items-center gap-1.5 text-xs text-slate-500">
+                    {isRoomHost ? "Host" : isCo ? "Co-host" : "Viewer"}
+                    {!isRoomHost && <SyncBadge report={viewerSync[p.socketId]} />}
+                  </p>
                 </div>
                 {isRoomHost ? (
                   <Crown size={15} className="text-amber-400" aria-label="Host" />
@@ -429,5 +457,20 @@ function ChatMessage({
         </div>
       </div>
     </div>
+  );
+}
+
+function SyncBadge({ report }: { report?: { state: "synced" | "drifting" | "buffering" | "error"; drift: number } }) {
+  if (!report) return null;
+  const styles = {
+    synced: { dot: "bg-emerald-400", text: "text-emerald-300", label: "In sync" },
+    drifting: { dot: "bg-amber-400", text: "text-amber-300", label: `${report.drift > 0 ? "Behind" : "Ahead"} ${Math.abs(report.drift).toFixed(1)}s` },
+    buffering: { dot: "bg-amber-400 animate-pulse", text: "text-amber-300", label: "Buffering" },
+    error: { dot: "bg-red-400", text: "text-red-300", label: "Can't play" },
+  }[report.state];
+  return (
+    <span className={`inline-flex items-center gap-1 ${styles.text}`}>
+      · <span className={`h-1.5 w-1.5 rounded-full ${styles.dot}`} /> {styles.label}
+    </span>
   );
 }

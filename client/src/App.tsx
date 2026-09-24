@@ -6,6 +6,10 @@ import Signup from "./pages/Signup";
 import Dashboard from "./pages/Dashboard";
 import Room from "./pages/Room";
 import NotFound from "./pages/NotFound";
+import ForgotPassword from "./pages/ForgotPassword";
+import ResetPassword from "./pages/ResetPassword";
+import Settings from "./pages/Settings";
+import { rememberAvatars } from "./store/useAvatarStore";
 import Toaster from "./components/ui/Toaster";
 import { useAuthStore } from "./store/useAuthStore";
 import { useSocketStore } from "./store/useSocketStore";
@@ -32,6 +36,11 @@ function GuestOnly({ children }: { children: ReactNode }) {
 
 function SessionSync() {
   const token = useAuthStore((s) => s.token);
+  const user = useAuthStore((s) => s.user);
+
+  useEffect(() => {
+    if (user) rememberAvatars({ [user.id]: user.avatarVersion ?? null });
+  }, [user]);
 
   // Validate the stored token once and pick up profile changes.
   useEffect(() => {
@@ -44,9 +53,12 @@ function SessionSync() {
       });
   }, [token]);
 
-  // Drop the realtime connection when the user signs out.
+  // Stay connected on every signed-in page so friends see accurate presence;
+  // drop the realtime connection when the user signs out.
   useEffect(() => {
-    if (!token) {
+    if (token) {
+      useSocketStore.getState().connect();
+    } else {
       useSocketStore.getState().disconnect();
     }
   }, [token]);
@@ -63,6 +75,9 @@ function App() {
           <Route path="/" element={<Home />} />
           <Route path="/login" element={<GuestOnly><Login /></GuestOnly>} />
           <Route path="/signup" element={<GuestOnly><Signup /></GuestOnly>} />
+          <Route path="/forgot-password" element={<GuestOnly><ForgotPassword /></GuestOnly>} />
+          <Route path="/reset-password" element={<ResetPassword />} />
+          <Route path="/settings" element={<RequireAuth><Settings /></RequireAuth>} />
           <Route path="/dashboard" element={<RequireAuth><Dashboard /></RequireAuth>} />
           <Route path="/room/:id" element={<RequireAuth><Room /></RequireAuth>} />
           <Route path="*" element={<NotFound />} />
