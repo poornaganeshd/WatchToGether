@@ -39,6 +39,11 @@ Watch videos in sync with friends, with video/voice chat, live chat and emoji re
 - Friend groups with one-click group invites
 - Web push notifications when the site is closed (opt-in per browser)
 - Multiple API instances behind a load balancer via Redis
+- Phone layout: video on top, Chat / Queue / People / Cameras tabs, and a bottom control bar; landscape goes full-screen
+- Search YouTube (or browse what's popular) from the Queue tab and play or queue with one tap
+- Screen sharing on desktop browsers (phone browsers don't support screen capture)
+
+> **Deploying?** See [DEPLOYMENT.md](DEPLOYMENT.md) — including how to check which build is live.
 
 ## Getting started
 
@@ -73,6 +78,7 @@ npm run dev                     # http://localhost:5173
 | `DATABASE_URL`, `DIRECT_URL` | PostgreSQL connection strings |
 | `JWT_SECRET` | Secret used to sign auth tokens (required) |
 | `CLIENT_URL` | Public client URL, used for invite links and CORS (comma-separate multiple origins) |
+| `YOUTUBE_API_KEY` | In-room YouTube search (YouTube Data API v3). Free quota ≈ 100 searches/day; results are cached |
 | `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`, `SMTP_FROM` | Email invitations and password reset. Without SMTP, reset links are printed to the server log in development |
 | `TURN_URLS`, `TURN_SECRET` | TURN relay for WebRTC. With a shared secret (coturn `use-auth-secret`) the API hands out 12-hour credentials. `TURN_USERNAME`/`TURN_CREDENTIAL` work for static credentials |
 | `TRUST_PROXY` | Set (e.g. `1`) behind a reverse proxy so rate limits see real client IPs |

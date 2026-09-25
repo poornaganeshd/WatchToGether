@@ -4,6 +4,8 @@ import { useSocketStore } from "../store/useSocketStore";
 import { useAudioStore } from "../store/useAudioStore";
 import { Captions, CaptionsOff, FileText, Timer, TimerOff, FileVideo, Link2, MonitorPlay, MonitorUp, RefreshCcw, Square, X } from "lucide-react";
 import SubtitleOverlay from "./SubtitleOverlay";
+import Modal from "./ui/Modal";
+import { isScreenShareSupported } from "../hooks/useWebRTC";
 import { toWebVtt } from "../lib/subtitles";
 import { toast } from "../store/useToastStore";
 
@@ -20,10 +22,15 @@ interface VideoPlayerProps {
   /** The single room host, whose player is the room's clock. */
   isRoomHost?: boolean;
   broadcastMediaStream?: (stream: MediaStream) => void;
+  stopBroadcast?: () => void;
   shareScreen?: () => void;
+  /** Phone layout: edge-to-edge, host controls in a sheet instead of a hover panel. */
+  compact?: boolean;
+  controlsSheetOpen?: boolean;
+  onControlsSheetClose?: () => void;
 }
 
-const VideoPlayer = forwardRef<VideoPlayerRef, VideoPlayerProps>(({ roomId, isFullscreen = false, isHost, isRoomHost = false, broadcastMediaStream, shareScreen }, ref) => {
+const VideoPlayer = forwardRef<VideoPlayerRef, VideoPlayerProps>(({ roomId, isFullscreen = false, isHost, isRoomHost = false, broadcastMediaStream, stopBroadcast, shareScreen, compact = false, controlsSheetOpen, onControlsSheetClose }, ref) => {
   const { socket } = useSocketStore();
   const subtitles = useSocketStore((s) => s.subtitles);
   const countdownEndsAt = useSocketStore((s) => s.countdownEndsAt);
@@ -562,6 +569,8 @@ const VideoPlayer = forwardRef<VideoPlayerRef, VideoPlayerProps>(({ roomId, isFu
   };
 
   const handleStopMedia = () => {
+    // A local file is shared as a captured stream; stop that broadcast too.
+    stopBroadcast?.();
     pendingUrlRef.current = null;
     setUrl("");
     setPlaying(false);
@@ -601,9 +610,8 @@ const VideoPlayer = forwardRef<VideoPlayerRef, VideoPlayerProps>(({ roomId, isFu
     }, 1000);
   };
 
-  return (
-    <div className={`flex flex-col w-full h-full relative group transition-all duration-300 ${isFullscreen ? '' : 'p-4'}`}>
-      <div className={`absolute z-10 flex flex-col items-end rounded-2xl border p-3 shadow-2xl backdrop-blur-xl transition-opacity duration-300 ${isFullscreen ? 'top-20 right-4' : 'top-20 right-6'} ${videoError ? 'opacity-100 bg-red-950/85 border-red-500/40' : 'opacity-0 group-hover:opacity-100 focus-within:opacity-100 bg-ink-900/85 border-white/10'}`}>
+  const controlsContent = (
+    <>
         {isHost ? (
           <div className="flex w-80 max-w-[calc(100vw-3rem)] flex-col gap-2.5">
             <form
@@ -668,7 +676,7 @@ const VideoPlayer = forwardRef<VideoPlayerRef, VideoPlayerProps>(({ roomId, isFu
               </div>
             )}
             <div className="flex items-center gap-2 border-t border-white/5 pt-2.5">
-              {shareScreen && (
+              {shareScreen && isScreenShareSupported() && (
                 <button onClick={shareScreen} className="btn-secondary flex-1 px-3 py-2 text-xs">
                   <MonitorUp size={14} /> Share screen
                 </button>
@@ -695,9 +703,45 @@ const VideoPlayer = forwardRef<VideoPlayerRef, VideoPlayerProps>(({ roomId, isFu
             Can't play this URL. Make sure it's a YouTube link or a direct video file.
           </div>
         )}
-      </div>
+    </>
+  );
 
-      <div className={`flex-1 overflow-hidden relative bg-black flex items-center justify-center transition-all duration-300 ${isFullscreen ? '' : 'rounded-2xl shadow-2xl ring-1 ring-white/10'}`}>
+  return (
+    <div className={`flex flex-col w-full h-full relative group transition-all duration-300 ${isFullscreen || compact ? '' : 'p-4'}`}>
+      {!compact && (
+      <div className={`absolute z-10 flex flex-col items-end rounded-2xl border p-3 shadow-2xl backdrop-blur-xl transition-opacity duration-300 ${isFullscreen ? 'top-20 right-4' : 'top-20 right-6'} ${videoError ? 'opacity-100 bg-red-950/85 border-red-500/40' : 'opacity-0 group-hover:opacity-100 focus-within:opacity-100 bg-ink-900/85 border-white/10'}`}>
+        {controlsContent}
+      </div>
+      )}
+      {compact && (
+        <>
+          {/* Phones: no hover, so viewers get small always-visible buttons and hosts a sheet. */}
+          {!isHost && (
+            <div className="absolute right-2 top-2 z-10 flex gap-1.5">
+              {subtitles && (
+                <button type="button" onClick={toggleSubtitles} className="grid h-8 w-8 place-items-center rounded-full bg-black/60 text-white backdrop-blur" aria-label={showSubtitles ? "Hide subtitles" : "Show subtitles"}>
+                  {showSubtitles ? <Captions size={15} /> : <CaptionsOff size={15} />}
+                </button>
+              )}
+              <button type="button" onClick={() => socket?.emit("request_sync", { roomId })} className="grid h-8 w-8 place-items-center rounded-full bg-black/60 text-white backdrop-blur" aria-label="Sync with host">
+                <RefreshCcw size={14} />
+              </button>
+            </div>
+          )}
+          {videoError && (
+            <p className="absolute inset-x-2 bottom-2 z-10 rounded-lg bg-red-950/90 px-3 py-2 text-center text-xs text-red-200">
+              Can't play this link. {isHost ? "Pick another video from Controls." : "Waiting for the host to pick another."}
+            </p>
+          )}
+          {isHost && (
+            <Modal isOpen={!!controlsSheetOpen} onClose={() => onControlsSheetClose?.()} title="Playback controls">
+              <div className="p-4 [&>div]:w-full [&>div]:max-w-none">{controlsContent}</div>
+            </Modal>
+          )}
+        </>
+      )}
+
+      <div className={`flex-1 overflow-hidden relative bg-black flex items-center justify-center transition-all duration-300 ${isFullscreen || compact ? '' : 'rounded-2xl shadow-2xl ring-1 ring-white/10'}`}>
         {url ? (
           <Player
             key={url}

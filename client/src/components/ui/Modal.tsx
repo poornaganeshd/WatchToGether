@@ -1,4 +1,5 @@
 import { useEffect, type ReactNode } from "react";
+import { createPortal } from "react-dom";
 import { X } from "lucide-react";
 
 interface ModalProps {
@@ -21,7 +22,11 @@ export default function Modal({ isOpen, onClose, title, children, maxWidth = "ma
 
   if (!isOpen) return null;
 
-  return (
+  // Portal to <body> (or the fullscreen element, so dialogs stay visible in fullscreen):
+  // a parent that creates its own stacking context would otherwise trap the modal beneath
+  // later siblings no matter how high its z-index is.
+  const host = (document.fullscreenElement as HTMLElement | null) ?? document.body;
+  return createPortal(
     <div
       className="fixed inset-0 z-[99999] flex items-center justify-center bg-black/70 p-4 backdrop-blur-sm animate-fade-in"
       onMouseDown={(e) => {
@@ -37,6 +42,7 @@ export default function Modal({ isOpen, onClose, title, children, maxWidth = "ma
         </div>
         {children}
       </div>
-    </div>
+    </div>,
+    host
   );
 }

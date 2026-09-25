@@ -446,7 +446,18 @@ async function runTests() {
     assert(roomManager.getChatSettings(privateRoomId).muted.length === 0, "Viewers can't mute anyone");
     host.socket.emit("set_slow_mode", { roomId: privateRoomId, seconds: 0 });
 
-    console.log("\n--- Test 30: Evicting a room notifies everyone ---");
+    console.log("\n--- Test 30: Playing a picked video for everyone ---");
+    guest.socket.emit("play_url", { roomId: privateRoomId, url: "https://www.youtube.com/watch?v=viewerpick" });
+    await wait(300);
+    assert(roomManager.getRoom(privateRoomId)?.playback.url !== "https://www.youtube.com/watch?v=viewerpick", "Viewers can't force a video");
+    host.socket.emit("play_url", { roomId: privateRoomId, url: "https://www.youtube.com/watch?v=hostpick" });
+    await wait(400);
+    assert(host.last("change_video")?.url === "https://www.youtube.com/watch?v=hostpick" && guest.last("change_video")?.url === "https://www.youtube.com/watch?v=hostpick", "Host's pick plays for everyone, host included");
+    host.socket.emit("play_url", { roomId: privateRoomId, url: "javascript:alert(1)" });
+    await wait(200);
+    assert(roomManager.getRoom(privateRoomId)?.playback.url === "https://www.youtube.com/watch?v=hostpick", "Non-http URLs are rejected");
+
+    console.log("\n--- Test 31: Evicting a room notifies everyone ---");
     roomManager.evictRoom(privateRoomId);
     await wait(300);
     assert(guest.last("room_ended")?.roomId === privateRoomId, "Participants receive room_ended");

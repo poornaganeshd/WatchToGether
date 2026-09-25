@@ -4,6 +4,7 @@ import { Rnd } from "react-rnd";
 
 import { useAudioStore } from "../store/useAudioStore";
 import { useSocketStore } from "../store/useSocketStore";
+import { isScreenShareSupported } from "../hooks/useWebRTC";
 
 interface VideoPlayerProps {
   stream: MediaStream;
@@ -106,6 +107,14 @@ function StreamPlayer({
           You
         </div>
       )}
+      {/* Who is this? (Camera-off tiles already say it in the middle.) */}
+      {!isLocal && isCamOn && name && !isCircle && (
+        <div
+          className={`absolute bottom-2 ${isMicOn ? "left-2" : "left-9"} z-20 max-w-[70%] truncate rounded-md bg-black/60 px-2 py-0.5 text-xs font-medium text-white backdrop-blur`}
+        >
+          {name}
+        </div>
+      )}
     </div>
   );
 }
@@ -174,6 +183,7 @@ export default function VideoGrid({ localStream, screenStream, peers, peerStatus
       <button onClick={() => setIsCircle(!isCircle)} className="p-2 rounded-lg transition-colors bg-slate-800/80 hover:bg-slate-700 text-white shadow" title="Toggle Camera Shape">
         {isCircle ? <Square size={16} /> : <Circle size={16} />}
       </button>
+      {isScreenShareSupported() && (
       <button 
         onClick={shareScreen} 
         className={`p-2 rounded-lg transition-colors shadow ${isSharingScreen ? 'bg-red-500/80 text-white border border-red-400' : 'bg-slate-800/80 hover:bg-slate-700 text-white'}`} 
@@ -181,6 +191,7 @@ export default function VideoGrid({ localStream, screenStream, peers, peerStatus
       >
         <MonitorUp size={16} />
       </button>
+      )}
       {toggleFullscreen && (
         <button onClick={toggleFullscreen} className="p-2 rounded-lg transition-colors bg-slate-800/80 hover:bg-slate-700 text-white shadow" title="Toggle Fullscreen">
           {isFullscreen ? <Minimize size={16} /> : <Maximize size={16} />}

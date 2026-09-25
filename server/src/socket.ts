@@ -789,6 +789,15 @@ export const setupSocketHandlers = (io: Server, gracePeriodOrManager?: number | 
       broadcastQueue(senderRoomId);
     });
 
+    // Host/co-host picks a video (e.g. from YouTube search): play it for everyone, sender included.
+    socket.on("play_url", (data) => {
+      const p = schemas.validateSocketPayload(schemas.queueAddSchema, data, socket);
+      if (!p) return;
+      const senderRoomId = roomManager.getSocketRoomId(socket.id);
+      if (senderRoomId !== p.roomId || !roomManager.isAuthorized(senderRoomId, userId)) return;
+      playUrlForRoom(senderRoomId, p.url);
+    });
+
     // Sent by the host's player when a video finishes.
     socket.on("queue_next", (data) => {
       const p = schemas.validateSocketPayload(schemas.roomOnlySchema, data, socket);

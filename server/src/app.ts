@@ -1,4 +1,5 @@
 import express from "express";
+import { execSync } from "child_process";
 import cors from "cors";
 import { createServer } from "http";
 import { Server } from "socket.io";
@@ -10,10 +11,28 @@ import { setupSocketHandlers } from "./socket";
 import { getAvatar } from "./controllers/auth";
 import { getIceServers } from "./controllers/rtc";
 import { getPushConfig, subscribePush, unsubscribePush } from "./controllers/push";
-import { authenticate } from "./middlewares/authMiddleware";
+import { authenticate, AuthRequest } from "./middlewares/authMiddleware";
+import { rateLimit } from "./middlewares/rateLimit";
+import { getYouTubeConfig, popularYouTube, searchYouTube } from "./controllers/youtube";
 import { RoomManager } from "./managers/RoomManager";
 import { createAdapter } from "@socket.io/redis-adapter";
 import type { RedisClient } from "./infra/redis";
+
+const STARTED_AT = new Date().toISOString();
+
+let serverCommit: string | null = null;
+const getServerCommit = () => (serverCommit ??= readServerCommit());
+
+const readServerCommit = () => {
+  const fromEnv =
+    process.env.GIT_COMMIT || process.env.RENDER_GIT_COMMIT || process.env.RAILWAY_GIT_COMMIT_SHA || process.env.SOURCE_COMMIT || process.env.VERCEL_GIT_COMMIT_SHA;
+  if (fromEnv) return fromEnv.slice(0, 7);
+  try {
+    return execSync("git rev-parse --short HEAD", { stdio: ["ignore", "pipe", "ignore"] }).toString().trim() || "unknown";
+  } catch {
+    return "unknown";
+  }
+};
 
 export const createApp = (options: { gracePeriodMs?: number; redis?: { pub: RedisClient; sub: RedisClient } | null } = {}) => {
   const app = express();
@@ -57,8 +76,22 @@ export const createApp = (options: { gracePeriodMs?: number; redis?: { pub: Redi
   app.get("/api/users/:id/avatar", getAvatar);
   app.get("/api/rtc/ice-servers", authenticate, getIceServers);
   app.get("/api/push/config", getPushConfig);
+  app.get("/api/youtube/config", getYouTubeConfig);
+  // Search spends shared API quota, so limit it per user.
+  app.get(
+    "/api/youtube/search",
+    authenticate,
+    rateLimit({ name: "yt-search", windowMs: 60 * 60 * 1000, max: 40, key: (req) => (req as AuthRequest).userId ?? null, message: "You've searched a lot this hour. Paste a link, or try again soon." }),
+    searchYouTube
+  );
+  app.get("/api/youtube/popular", authenticate, popularYouTube);
   app.post("/api/push/subscribe", authenticate, subscribePush);
   app.delete("/api/push/subscribe", authenticate, unsubscribePush);
+
+  // Which build is running, to check a deploy actually went out.
+  app.get("/api/health", (_req, res) => {
+    res.status(200).json({ ok: true, commit: getServerCommit(), startedAt: STARTED_AT });
+  });
 
   app.get("/", (req, res) => {
     res.send("CineSync API");
