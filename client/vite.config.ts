@@ -1,4 +1,4 @@
-import { defineConfig } from 'vite'
+import { defineConfig, type Plugin } from 'vite'
 import react from '@vitejs/plugin-react'
 import { execSync } from 'child_process'
 
@@ -12,12 +12,23 @@ const commit = (() => {
   }
 })()
 
+const builtAt = new Date().toISOString()
+
+// Published next to index.html so open tabs can notice a newer deploy and offer a reload.
+const versionFile = (): Plugin => ({
+  name: 'version-file',
+  apply: 'build',
+  generateBundle() {
+    this.emitFile({ type: 'asset', fileName: 'version.json', source: JSON.stringify({ commit, builtAt }) })
+  },
+})
+
 // https://vite.dev/config/
 export default defineConfig({
-  plugins: [react()],
+  plugins: [react(), versionFile()],
   define: {
     'process.env': {},
     __APP_COMMIT__: JSON.stringify(commit),
-    __APP_BUILT_AT__: JSON.stringify(new Date().toISOString()),
+    __APP_BUILT_AT__: JSON.stringify(builtAt),
   },
 })

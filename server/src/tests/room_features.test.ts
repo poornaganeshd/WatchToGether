@@ -457,7 +457,21 @@ async function runTests() {
     await wait(200);
     assert(roomManager.getRoom(privateRoomId)?.playback.url === "https://www.youtube.com/watch?v=hostpick", "Non-http URLs are rejected");
 
-    console.log("\n--- Test 31: Evicting a room notifies everyone ---");
+    console.log("\n--- Test 31: Queueing a whole playlist ---");
+    const queueBefore = roomManager.getQueue(privateRoomId).length;
+    guest.socket.emit("queue_add_many", { roomId: privateRoomId, urls: ["https://www.youtube.com/watch?v=g1"] });
+    await wait(300);
+    assert(roomManager.getQueue(privateRoomId).length === queueBefore, "Viewers can't bulk-add a playlist");
+    const playlistUrls = ["p1", "p2", "p3"].map((v) => `https://www.youtube.com/watch?v=${v}`);
+    const bulk = (await host.socket.timeout(2000).emitWithAck("queue_add_many", { roomId: privateRoomId, urls: playlistUrls })) as { added: number; skipped: number };
+    await wait(200);
+    const bulkQueue = host.last("queue_updated") as { url: string }[];
+    assert(bulk.added === 3 && bulk.skipped === 0 && playlistUrls.every((u) => bulkQueue.some((q) => q.url === u)), "Host adds every playlist video in one go", bulk);
+    const overflow = Array.from({ length: 50 }, (_, i) => `https://www.youtube.com/watch?v=o${i}`);
+    const full = (await host.socket.timeout(2000).emitWithAck("queue_add_many", { roomId: privateRoomId, urls: overflow })) as { added: number; skipped: number };
+    assert(roomManager.getQueue(privateRoomId).length === 50 && full.added + full.skipped === 50 && full.skipped > 0, "Bulk add stops when the queue is full and reports what was skipped", full);
+
+    console.log("\n--- Test 32: Evicting a room notifies everyone ---");
     roomManager.evictRoom(privateRoomId);
     await wait(300);
     assert(guest.last("room_ended")?.roomId === privateRoomId, "Participants receive room_ended");

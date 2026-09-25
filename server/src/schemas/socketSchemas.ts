@@ -98,6 +98,14 @@ export const queueAddSchema = z.object({
   url: z.string().trim().url().max(2000).refine((u) => /^https?:\/\//i.test(u), "Only http(s) links are supported"),
 });
 
+export const queueAddManySchema = z.object({
+  roomId: z.string().uuid(),
+  urls: z
+    .array(z.string().trim().url().max(2000).refine((u) => /^https?:\/\//i.test(u), "Only http(s) links are supported"))
+    .min(1)
+    .max(50),
+});
+
 export const queueItemSchema = z.object({
   roomId: z.string().uuid(),
   itemId: z.string().min(1).max(100),

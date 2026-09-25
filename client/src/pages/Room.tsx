@@ -19,6 +19,7 @@ import PasswordPrompt from "../components/PasswordPrompt";
 import { ReactionOverlay, ReactionPicker } from "../components/Reactions";
 import CountdownOverlay from "../components/CountdownOverlay";
 import CameraPopout from "../components/CameraPopout";
+import ChatOverlay from "../components/ChatOverlay";
 import MobileControlBar from "../components/MobileControlBar";
 import { useIsMobile } from "../lib/useMediaQuery";
 import { toast } from "../store/useToastStore";
@@ -554,6 +555,9 @@ export default function Room() {
           }
           style={isFullscreen ? { width: '100vw', height: '100vh', maxWidth: 'none', maxHeight: 'none' } : undefined}
         >
+          {/* New chat messages over the video when the chat panel can't be seen */}
+          {(isFullscreen || isMobile) && <ChatOverlay className={isFullscreen ? "" : "hidden landscape:flex"} />}
+
           {/* Edge Triggers (desktop hover reveal) */}
           {!isMobile && (
             <>

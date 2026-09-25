@@ -1,6 +1,7 @@
 import { Server, Socket } from "socket.io";
 import { PrismaClient } from "@prisma/client";
 import { verifyAuthToken } from "./middlewares/authMiddleware";
+import { recordWatched } from "./services/watchHistory";
 import { RoomManager } from "./managers/RoomManager";
 import * as schemas from "./schemas/socketSchemas";
 import { verifyRoomPassword } from "./utils/roomPassword";
@@ -231,6 +232,7 @@ export const setupSocketHandlers = (io: Server, gracePeriodOrManager?: number | 
         // Send the current authoritative state to the joining user
         if (room) {
           socket.emit("sync_response", { ...room.playback, serverTime: Date.now() });
+          if (room.playback.url) void recordWatched([userId], room.playback.url, roomId);
           socket.emit("room_state", { hostId: room.hostId, coHosts: Array.from(room.coHosts), startedAt: room.startedAt });
           socket.emit("queue_updated", room.queue);
           socket.emit("subtitles_updated", room.subtitles);
@@ -754,6 +756,31 @@ export const setupSocketHandlers = (io: Server, gracePeriodOrManager?: number | 
         return;
       }
       broadcastQueue(senderRoomId);
+    });
+
+    // A whole playlist at once. Hosts and co-hosts only, since it can fill the queue.
+    socket.on("queue_add_many", (data, ack?: (result: { added: number; skipped: number }) => void) => {
+      const reply = typeof ack === "function" ? ack : () => undefined;
+      const p = schemas.validateSocketPayload(schemas.queueAddManySchema, data, socket);
+      if (!p) return;
+      const senderRoomId = roomManager.getSocketRoomId(socket.id);
+      if (senderRoomId !== p.roomId) return;
+      if (!roomManager.isAuthorized(senderRoomId, userId)) {
+        socket.emit("error", { message: "Only hosts can queue a whole playlist" });
+        return;
+      }
+      if (!queueLimiter.allow(socket.id)) {
+        socket.emit("error", { message: "You're adding videos too quickly" });
+        return;
+      }
+      const addedByName = roomManager.getParticipantName(senderRoomId, socket.id) || "Someone";
+      let added = 0;
+      for (const url of p.urls) {
+        if (!roomManager.addToQueue(senderRoomId, { id: randomUUID(), url, addedBy: userId, addedByName })) break;
+        added++;
+      }
+      if (added) broadcastQueue(senderRoomId);
+      reply({ added, skipped: p.urls.length - added });
     });
 
     socket.on("queue_remove", (data) => {

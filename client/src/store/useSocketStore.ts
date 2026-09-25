@@ -234,6 +234,9 @@ export const useSocketStore = create<SocketState>((set, get) => ({
 
       socket.on('connect_error', (err) => {
         console.error("Socket Connect Error:", err);
+        if (!err.message?.startsWith('Authentication error')) {
+          import('./useServerStatus').then((m) => m.useServerStatus.getState().check());
+        }
         if (err.message?.startsWith('Authentication error') && useAuthStore.getState().token) {
           // Token expired or revoked (e.g. password changed elsewhere): stop retrying and sign out.
           socket.disconnect();
@@ -251,7 +254,7 @@ export const useSocketStore = create<SocketState>((set, get) => ({
         if (isMention) {
           playMentionChime();
           if (document.hidden && 'Notification' in window && Notification.permission === 'granted') {
-            new Notification(`${message.userName} mentioned you`, { body: message.content.slice(0, 140), icon: '/favicon.svg' });
+            new Notification(`${message.userName} mentioned you`, { body: message.content.slice(0, 140), icon: '/icon-192.png' });
           }
         }
         set((state) => ({

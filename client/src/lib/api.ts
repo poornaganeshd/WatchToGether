@@ -23,6 +23,10 @@ api.interceptors.response.use(
     if (error.response?.status === 401 && !isAuthRoute && useAuthStore.getState().token) {
       useAuthStore.getState().logout();
     }
+    // No response at all: the server may be asleep (free hosting) or unreachable.
+    if (!error.response && error.code !== 'ERR_CANCELED') {
+      import('../store/useServerStatus').then((m) => m.useServerStatus.getState().check());
+    }
     return Promise.reject(error);
   }
 );

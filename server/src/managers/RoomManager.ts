@@ -1,4 +1,5 @@
 import { PrismaClient } from "@prisma/client";
+import { DEFAULT_PLAYBACK_URL, recordWatched } from "../services/watchHistory";
 import { Server } from "socket.io";
 
 const prisma = new PrismaClient();
@@ -172,7 +173,7 @@ export class RoomManager {
           playback: {
             playing: false,
             time: dbRoom.playbackTime ?? 0,
-            url: dbRoom.playbackUrl ?? "https://www.youtube.com/watch?v=aqz-KE-bpKQ",
+            url: dbRoom.playbackUrl ?? DEFAULT_PLAYBACK_URL,
             lastUpdatedAt: Date.now(),
           },
         };
@@ -644,6 +645,8 @@ export class RoomManager {
       room.skipVotes.clear();
       room.participantSync.clear();
       if (room.playback.url) {
+        // Everyone in the room now has this in their "Recently watched".
+        void recordWatched([...room.participants.values()], room.playback.url, roomId);
         room.recentlyPlayed = [
           { url: room.playback.url, playedAt: Date.now() },
           ...room.recentlyPlayed.filter((r) => r.url !== room.playback.url),

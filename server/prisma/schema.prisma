@@ -35,6 +35,22 @@ model User {
   friendGroups  FriendGroup[]
   groupMemberships FriendGroupMember[]
   pushSubscriptions PushSubscription[]
+  watchedVideos WatchedVideo[]
+}
+
+/// Videos a user has watched in rooms, newest first, for "Recently watched".
+model WatchedVideo {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  url       String
+  title     String?
+  roomId    String?
+  roomName  String?
+  watchedAt DateTime @default(now())
+
+  @@unique([userId, url])
+  @@index([userId, watchedAt])
 }
 
 model Room {

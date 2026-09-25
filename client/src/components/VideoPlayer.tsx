@@ -30,6 +30,9 @@ interface VideoPlayerProps {
   onControlsSheetClose?: () => void;
 }
 
+const SKIP_SECONDS = 10;
+const DOUBLE_TAP_MS = 350;
+
 const VideoPlayer = forwardRef<VideoPlayerRef, VideoPlayerProps>(({ roomId, isFullscreen = false, isHost, isRoomHost = false, broadcastMediaStream, stopBroadcast, shareScreen, compact = false, controlsSheetOpen, onControlsSheetClose }, ref) => {
   const { socket } = useSocketStore();
   const subtitles = useSocketStore((s) => s.subtitles);
@@ -483,6 +486,7 @@ const VideoPlayer = forwardRef<VideoPlayerRef, VideoPlayerProps>(({ roomId, isFu
   ) : null;
 
   const handlePlay = () => {
+    setAutoplayBlockedUrl(null);
     if (isHandlingRemote.current) return;
     if (!isHost) {
       // Starting playback is fine if the room is playing (e.g. after an autoplay block).
@@ -507,12 +511,49 @@ const VideoPlayer = forwardRef<VideoPlayerRef, VideoPlayerProps>(({ roomId, isFu
 
   const handleSeek = (seconds: number) => {
     if (isHandlingRemote.current) return;
+    // The player reports our own double-tap skip back as a seek (sometimes with a stale time).
+    if (Date.now() < ownSkipUntilRef.current) return;
     if (!isHostRef.current) {
       socket?.emit("request_sync", { roomId });
       return;
     }
     socket?.emit("seek_video", { roomId, time: seconds });
   };
+
+  // Phones: double-tap the left/right edge to skip, like the YouTube app (hosts only; viewers follow).
+  const [skipFlash, setSkipFlash] = useState<{ side: "back" | "forward"; seconds: number; key: number } | null>(null);
+  const lastTapRef = useRef<{ side: "back" | "forward"; at: number } | null>(null);
+  const ownSkipUntilRef = useRef(0);
+  const skipBy = (side: "back" | "forward") => {
+    const player = playerRef.current;
+    if (!player || typeof player.getCurrentTime !== "function") return;
+    const delta = side === "forward" ? SKIP_SECONDS : -SKIP_SECONDS;
+    const target = Math.max(0, (player.getCurrentTime() || 0) + delta);
+    ownSkipUntilRef.current = Date.now() + 1000;
+    player.seekTo(target, "seconds");
+    socket?.emit("seek_video", { roomId, time: target });
+    setSkipFlash((prev) => ({
+      side,
+      // Repeated double-taps add up (10s, 20s, 30s…) while the badge is showing.
+      seconds: prev && prev.side === side ? prev.seconds + SKIP_SECONDS : SKIP_SECONDS,
+      key: Date.now(),
+    }));
+  };
+  const onEdgeTap = (side: "back" | "forward") => {
+    const now = Date.now();
+    const last = lastTapRef.current;
+    if (last && last.side === side && now - last.at < DOUBLE_TAP_MS) {
+      lastTapRef.current = { side, at: now };
+      skipBy(side);
+      return;
+    }
+    lastTapRef.current = { side, at: now };
+  };
+  useEffect(() => {
+    if (!skipFlash) return;
+    const t = setTimeout(() => setSkipFlash(null), 700);
+    return () => clearTimeout(t);
+  }, [skipFlash]);
 
   const handleProgress = (state: { playedSeconds: number }) => {
     if (isRoomHostRef.current) return;
@@ -543,6 +584,32 @@ const VideoPlayer = forwardRef<VideoPlayerRef, VideoPlayerProps>(({ roomId, isFu
   }, [erroredUrl]);
   const videoError = !!url && erroredUrl === url;
   const setVideoError = (failed: boolean) => setErroredUrl(failed ? urlRef.current : null);
+
+  // Phones block starting video with sound until the person taps; that isn't a broken link.
+  const [autoplayBlockedUrl, setAutoplayBlockedUrl] = useState<string | null>(null);
+  const autoplayBlocked = !!url && autoplayBlockedUrl === url && !videoError;
+  const handlePlayerError = (err: unknown, failedUrl: string) => {
+    const name = (err as { name?: string } | null)?.name;
+    if (name === "NotAllowedError") {
+      setAutoplayBlockedUrl(failedUrl);
+      return;
+    }
+    // play() interrupted by a pause or a new video: harmless.
+    if (name === "AbortError") return;
+    // Tied to the video that failed, so a late error from the previous video can't flag the new one.
+    setErroredUrl(failedUrl);
+  };
+  const startAfterTap = () => {
+    setAutoplayBlockedUrl(null);
+    const internal = playerRef.current?.getInternalPlayer?.();
+    if (internal && typeof internal.play === "function") {
+      Promise.resolve(internal.play()).catch(() => undefined);
+    } else if (internal && typeof internal.playVideo === "function") {
+      internal.playVideo();
+    }
+    if (isHostRef.current) setPlaying(true);
+    else socket?.emit("request_sync", { roomId });
+  };
 
   const changeVideo = (e: React.FormEvent) => {
     e.preventDefault();
@@ -736,6 +803,7 @@ const VideoPlayer = forwardRef<VideoPlayerRef, VideoPlayerProps>(({ roomId, isFu
           {isHost && (
             <Modal isOpen={!!controlsSheetOpen} onClose={() => onControlsSheetClose?.()} title="Playback controls">
               <div className="p-4 [&>div]:w-full [&>div]:max-w-none">{controlsContent}</div>
+              <p className="px-4 pb-4 text-xs text-slate-500">Tip: double-tap the left or right edge of the video to skip 10 seconds for everyone.</p>
             </Modal>
           )}
         </>
@@ -756,7 +824,7 @@ const VideoPlayer = forwardRef<VideoPlayerRef, VideoPlayerProps>(({ roomId, isFu
             onPause={handlePause}
             onSeek={handleSeek}
             onProgress={handleProgress}
-            onError={() => setVideoError(true)}
+            onError={(err: unknown) => handlePlayerError(err, url)}
             onEnded={handleEnded}
             onBuffer={handleBuffer}
             onBufferEnd={handleBufferEnd}
@@ -770,8 +838,40 @@ const VideoPlayer = forwardRef<VideoPlayerRef, VideoPlayerProps>(({ roomId, isFu
               <MonitorPlay size={36} className="text-slate-400" />
             </div>
             <p className="font-medium text-slate-300">{isHost ? "Nothing playing yet" : "Waiting for the host to play something"}</p>
-            <p className="mt-1 text-sm">{isHost ? "Hover here and paste a video link to get started." : "Grab a snack — it'll start for everyone at once."}</p>
+            <p className="mt-1 text-sm">{isHost ? (compact ? "Open the Queue tab below to find a video." : "Hover here and paste a video link to get started.") : "Grab a snack — it'll start for everyone at once."}</p>
           </div>
+        )}
+        {url && compact && isHost && (
+          <>
+            {(["back", "forward"] as const).map((side) => (
+              <div
+                key={side}
+                // Leaves the middle and the bottom control strip to YouTube's own controls.
+                className={`absolute top-10 bottom-12 z-[5] w-[22%] ${side === "back" ? "left-0" : "right-0"}`}
+                onClick={() => onEdgeTap(side)}
+                aria-hidden="true"
+              />
+            ))}
+            {skipFlash && (
+              <div
+                key={skipFlash.key}
+                className={`pointer-events-none absolute top-1/2 z-[6] -translate-y-1/2 animate-fade-up rounded-full bg-black/60 px-3 py-1.5 text-xs font-semibold text-white backdrop-blur ${skipFlash.side === "back" ? "left-4" : "right-4"}`}
+              >
+                {skipFlash.side === "back" ? `« ${skipFlash.seconds}s` : `${skipFlash.seconds}s »`}
+              </div>
+            )}
+          </>
+        )}
+        {autoplayBlocked && (
+          <button
+            type="button"
+            onClick={startAfterTap}
+            className="absolute inset-0 z-[7] grid place-items-center bg-black/50 text-white"
+          >
+            <span className="flex items-center gap-2 rounded-full bg-white px-4 py-2 text-sm font-semibold text-ink-950 shadow-xl">
+              <MonitorPlay size={16} /> Tap to start watching
+            </span>
+          </button>
         )}
         {url && subtitles && showSubtitles && (
           <SubtitleOverlay vtt={subtitles.vtt} getCurrentTime={readCurrentTime} isFullscreen={isFullscreen} />

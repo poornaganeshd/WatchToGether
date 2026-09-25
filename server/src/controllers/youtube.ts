@@ -6,6 +6,9 @@ import { getRedis } from "../infra/redis";
 const API_BASE = () => (process.env.YOUTUBE_API_BASE || "https://www.googleapis.com/youtube/v3").replace(/\/+$/, "");
 const SEARCH_TTL_SECONDS = 60 * 60;
 const POPULAR_TTL_SECONDS = 2 * 60 * 60;
+const PLAYLIST_TTL_SECONDS = 60 * 60;
+// Matches the room queue's capacity.
+const MAX_PLAYLIST_ITEMS = 50;
 
 export const isYouTubeSearchEnabled = () => !!process.env.YOUTUBE_API_KEY;
 
@@ -205,6 +208,53 @@ export const popularYouTube = async (req: Request, res: Response): Promise<void>
     });
     res.status(200).json(data);
   } catch (err) {
+    respondError(res, err);
+  }
+};
+
+export const playlistYouTube = async (req: Request, res: Response): Promise<void> => {
+  if (!isYouTubeSearchEnabled()) {
+    res.status(503).json({ error: "YouTube search isn't set up on this server" });
+    return;
+  }
+  const id = typeof req.query.id === "string" ? req.query.id.trim() : "";
+  if (!/^[A-Za-z0-9_-]{2,64}$/.test(id)) {
+    res.status(400).json({ error: "That doesn't look like a YouTube playlist link" });
+    return;
+  }
+  try {
+    const data = await cached(`playlist:${id}`, PLAYLIST_TTL_SECONDS, async () => {
+      // playlists.list and playlistItems.list cost 1 unit each.
+      const [meta, items] = (await Promise.all([
+        callApi("playlists", { part: "snippet,contentDetails", id }),
+        callApi("playlistItems", { part: "snippet,contentDetails", playlistId: id, maxResults: String(MAX_PLAYLIST_ITEMS) }),
+      ])) as [
+        { items?: { snippet?: { title?: string; channelTitle?: string }; contentDetails?: { itemCount?: number } }[] },
+        { items?: (ApiVideo & { contentDetails?: { videoId?: string } })[] },
+      ];
+      const playlist = meta.items?.[0];
+      if (!playlist) return null;
+      const videos = (items.items ?? [])
+        .map((i) => ({ ...i, id: i.contentDetails?.videoId ?? "" }))
+        // Removed and private videos stay in playlists with placeholder titles.
+        .filter((i) => i.id && i.snippet?.title !== "Deleted video" && i.snippet?.title !== "Private video");
+      return {
+        title: decodeEntities(playlist.snippet?.title ?? "Playlist"),
+        channel: decodeEntities(playlist.snippet?.channelTitle ?? ""),
+        totalCount: playlist.contentDetails?.itemCount ?? videos.length,
+        results: videos.map((v) => toResult(v, new Map())).filter(Boolean) as YouTubeResult[],
+      };
+    });
+    if (!data) {
+      res.status(404).json({ error: "Playlist not found (it may be private)" });
+      return;
+    }
+    res.status(200).json(data);
+  } catch (err) {
+    if (err instanceof YouTubeApiError && err.status === 404) {
+      res.status(404).json({ error: "Playlist not found (it may be private)" });
+      return;
+    }
     respondError(res, err);
   }
 };

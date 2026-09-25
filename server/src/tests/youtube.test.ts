@@ -60,6 +60,21 @@ async function run() {
       }));
       return;
     }
+    if (url.pathname.endsWith("/playlists")) {
+      const found = url.searchParams.get("id") === "PLgood";
+      res.end(JSON.stringify({ items: found ? [{ snippet: { title: "Road &amp; Trip", channelTitle: "Chan" }, contentDetails: { itemCount: 3 } }] : [] }));
+      return;
+    }
+    if (url.pathname.endsWith("/playlistItems")) {
+      res.end(JSON.stringify({
+        items: [
+          { snippet: { title: "Song one", channelTitle: "Chan" }, contentDetails: { videoId: "s1" } },
+          { snippet: { title: "Deleted video" }, contentDetails: { videoId: "gone" } },
+          { snippet: { title: "Song two", channelTitle: "Chan" }, contentDetails: { videoId: "s2" } },
+        ],
+      }));
+      return;
+    }
     if (url.pathname.endsWith("/videos")) {
       res.end(JSON.stringify({ items: [{ id: "abc123", contentDetails: { duration: "PT1H2M3S" } }, { id: "live999", contentDetails: { duration: "P0D" } }] }));
       return;
@@ -124,6 +139,16 @@ async function run() {
     assert(r.status === 200 && r.json.results.length === 1 && r.json.results[0].id === "pop1", "Popular feed drops non-embeddable videos", r.json);
     assert(r.json.results[0].durationSeconds === 245, "Popular results include durations");
     assert(calls.some((c) => c.params.get("regionCode") === "GB"), "Region is passed through");
+
+    console.log("\n--- Playlists ---");
+    r = await get("/youtube/playlist?id=PLgood");
+    assert(r.status === 200 && r.json.title === "Road & Trip" && r.json.totalCount === 3, "Playlist details are returned", r.json);
+    assert(r.json.results.map((v: { id: string }) => v.id).join(",") === "s1,s2", "Deleted and private videos are left out", r.json.results);
+    assert(r.json.results[0].url === "https://www.youtube.com/watch?v=s1", "Playlist videos carry playable URLs");
+    r = await get("/youtube/playlist?id=PLmissing");
+    assert(r.status === 404, "Unknown playlists give a clear 404");
+    r = await get("/youtube/playlist?id=bad%20id");
+    assert(r.status === 400, "Malformed playlist ids are rejected");
 
     console.log("\n--- Quota ---");
     quotaExceeded = true;

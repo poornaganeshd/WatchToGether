@@ -1,7 +1,7 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import {
-  CalendarClock, CalendarPlus, Check, Clapperboard, Copy, Crown, Settings as SettingsIcon, Globe2, History, KeyRound, Lock, LogIn, LogOut, MonitorPlay, Plus, RefreshCw, Search,
+  CalendarClock, CalendarPlus, Check, Clapperboard, Copy, Crown, Settings as SettingsIcon, Globe2, History, KeyRound, Lock, LogIn, LogOut, MonitorPlay, Play, Plus, RefreshCw, Search,
   Trash2, UserMinus, UserPlus, Users, X,
 } from "lucide-react";
 import api, { getErrorMessage } from "../lib/api";
@@ -9,6 +9,8 @@ import { useAuthStore } from "../store/useAuthStore";
 import { useSocketStore } from "../store/useSocketStore";
 import { toast } from "../store/useToastStore";
 import { copyToClipboard, greeting, timeAgo } from "../lib/format";
+import { InstallAppCard } from "../components/InstallApp";
+import RecentlyWatched from "../components/RecentlyWatched";
 import Logo from "../components/ui/Logo";
 import Avatar from "../components/ui/Avatar";
 import Spinner from "../components/ui/Spinner";
@@ -57,6 +59,8 @@ export default function Dashboard() {
   const [loading, setLoading] = useState({ live: true, friends: true, history: true, upcoming: true });
 
   const [roomName, setRoomName] = useState("");
+  const [startVideo, setStartVideo] = useState<{ url: string; title: string } | null>(null);
+  const createFormRef = useRef<HTMLFormElement>(null);
   const [isPrivate, setIsPrivate] = useState(true);
   const [createPassword, setCreatePassword] = useState("");
   const [isCreating, setIsCreating] = useState(false);
@@ -181,7 +185,7 @@ export default function Dashboard() {
           : undefined
       );
       if ("Notification" in window && Notification.permission === "granted" && document.hidden) {
-        const n = new Notification(data.title, { body: data.body, icon: "/favicon.svg" });
+        const n = new Notification(data.title, { body: data.body, icon: "/icon-192.png" });
         if (data.roomId) {
           n.onclick = () => {
             window.focus();
@@ -245,10 +249,12 @@ export default function Dashboard() {
         isPrivate,
         password: isPrivate ? createPassword : undefined,
         scheduledFor,
+        videoUrl: startVideo?.url,
       });
       if (scheduledFor) {
         toast.success("Watch party scheduled — your friends have been notified.");
         setRoomName("");
+        setStartVideo(null);
         setCreatePassword("");
         setScheduleLater(false);
         setIsCreating(false);
@@ -397,9 +403,20 @@ export default function Dashboard() {
           <h1 className="font-display text-3xl font-bold tracking-tight sm:text-4xl">{user.name.split(" ")[0]} 👋</h1>
         </section>
 
+        <InstallAppCard />
+
+        <RecentlyWatched
+          onWatchAgain={(video, title) => {
+            setStartVideo({ url: video.url, title });
+            setRoomName((current) => current.trim() || title.slice(0, 100));
+            createFormRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
+            createFormRef.current?.querySelector("input")?.focus({ preventScroll: true });
+          }}
+        />
+
         <section className="mb-10 grid gap-4 md:grid-cols-2">
           {/* Create */}
-          <form onSubmit={handleCreateRoom} className="card relative overflow-hidden p-6 animate-fade-up">
+          <form ref={createFormRef} onSubmit={handleCreateRoom} className="card relative overflow-hidden p-6 animate-fade-up">
             <div className="pointer-events-none absolute -right-16 -top-16 h-48 w-48 rounded-full bg-indigo-500/20 blur-3xl" />
             <div className="mb-5 flex items-center gap-3">
               <div className="grid h-10 w-10 place-items-center rounded-xl bg-gradient-to-br from-indigo-500 to-violet-500 shadow-glow">
@@ -420,6 +437,15 @@ export default function Dashboard() {
                 className="input"
                 required
               />
+              {startVideo && (
+                <div className="flex items-center gap-2 rounded-xl border border-indigo-400/20 bg-indigo-500/10 px-3 py-2 text-xs text-indigo-100">
+                  <Play size={13} className="shrink-0" />
+                  <span className="min-w-0 flex-1 truncate">Starts with <b>{startVideo.title}</b></span>
+                  <button type="button" onClick={() => setStartVideo(null)} className="rounded p-0.5 hover:bg-white/10" aria-label="Don't start with this video">
+                    <X size={13} />
+                  </button>
+                </div>
+              )}
               <div className="grid grid-cols-2 gap-2 rounded-xl border border-white/10 bg-ink-900/60 p-1">
                 {[
                   { value: true, label: "Private", icon: Lock },

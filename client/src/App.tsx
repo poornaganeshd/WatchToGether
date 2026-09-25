@@ -13,6 +13,7 @@ import InviteAccept from "./pages/InviteAccept";
 import Replay from "./pages/Replay";
 import { rememberAvatars } from "./store/useAvatarStore";
 import Toaster from "./components/ui/Toaster";
+import AppBanners from "./components/AppBanners";
 import { useAuthStore } from "./store/useAuthStore";
 import { useSocketStore } from "./store/useSocketStore";
 import api from "./lib/api";
@@ -87,6 +88,7 @@ function App() {
           <Route path="*" element={<NotFound />} />
         </Routes>
       </div>
+      <AppBanners />
       <Toaster />
     </BrowserRouter>
   );

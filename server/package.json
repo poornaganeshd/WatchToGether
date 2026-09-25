@@ -8,7 +8,7 @@
     "build": "npx prisma generate && tsc",
     "start": "node dist/index.js",
     "start:migrate": "prisma migrate deploy && node dist/index.js",
-    "test": "ts-node src/tests/room_features.test.ts && ts-node src/tests/http_features.test.ts && ts-node src/tests/youtube.test.ts && ts-node src/tests/room_lifecycle.test.ts && ts-node src/tests/reconnection.test.ts && ts-node src/tests/camera_lifecycle.test.ts && ts-node src/tests/remote_audio_pipeline.test.ts && ts-node src/tests/local_video_presentation.test.ts && ts-node src/tests/multi_instance.test.ts"
+    "test": "ts-node src/tests/room_features.test.ts && ts-node src/tests/http_features.test.ts && ts-node src/tests/youtube.test.ts && ts-node src/tests/watch_history.test.ts && ts-node src/tests/room_lifecycle.test.ts && ts-node src/tests/reconnection.test.ts && ts-node src/tests/camera_lifecycle.test.ts && ts-node src/tests/remote_audio_pipeline.test.ts && ts-node src/tests/local_video_presentation.test.ts && ts-node src/tests/multi_instance.test.ts"
   },
   "keywords": [],
   "author": "",

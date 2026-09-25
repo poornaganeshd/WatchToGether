@@ -45,6 +45,14 @@ const createRoomSchema = z.object({
   isPrivate: z.boolean().optional(),
   password: z.string().max(100, "Password is too long").optional(),
   scheduledFor: scheduleSchema.optional(),
+  // Start the room on this video (e.g. "Watch again").
+  videoUrl: z
+    .string()
+    .trim()
+    .url("That video link isn't valid")
+    .max(2000)
+    .refine((u) => /^https?:\/\//i.test(u), "Only http(s) links are supported")
+    .optional(),
 });
 
 const updateRoomSchema = z.object({
@@ -120,7 +128,7 @@ export const createRoom = async (req: AuthRequest, res: Response): Promise<void>
       res.status(400).json({ error: parsed.error.issues[0].message });
       return;
     }
-    const { name, description, isPrivate, password, scheduledFor } = parsed.data;
+    const { name, description, isPrivate, password, scheduledFor, videoUrl } = parsed.data;
     const trimmedPassword = password?.trim() || null;
 
     if (isPrivate && !trimmedPassword) {
@@ -151,6 +159,7 @@ export const createRoom = async (req: AuthRequest, res: Response): Promise<void>
         password: isPrivate && trimmedPassword ? await hashRoomPassword(trimmedPassword) : null,
         hostId,
         scheduledFor: scheduledFor ?? null,
+        playbackUrl: videoUrl ?? null,
       },
       select: publicRoomSelect,
     });

@@ -42,6 +42,11 @@ Watch videos in sync with friends, with video/voice chat, live chat and emoji re
 - Phone layout: video on top, Chat / Queue / People / Cameras tabs, and a bottom control bar; landscape goes full-screen
 - Search YouTube (or browse what's popular) from the Queue tab and play or queue with one tap
 - Screen sharing on desktop browsers (phone browsers don't support screen capture)
+- Install it as an app (home-screen icon, opens full screen); a banner offers a reload when a new version is deployed
+- A "waking up the server" notice while free hosting starts the API after a quiet period
+- Paste a YouTube playlist link to queue the whole playlist (hosts); recent searches are remembered
+- Phones: double-tap the left/right edge of the video to skip 10 s (hosts); new chat messages float over the video in landscape
+- "Recently watched" on the dashboard, with one tap to start a new watch party on a video
 
 > **Deploying?** See [DEPLOYMENT.md](DEPLOYMENT.md) — including how to check which build is live.
 

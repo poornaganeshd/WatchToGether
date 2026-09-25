@@ -1,5 +1,5 @@
 import { useRef, useState } from "react";
-import { ArrowLeft, Camera, KeyRound, Trash2, UserRound } from "lucide-react";
+import { ArrowLeft, Camera, KeyRound, Smartphone, Trash2, UserRound } from "lucide-react";
 import api, { getErrorMessage } from "../lib/api";
 import { resizeAvatar } from "../lib/image";
 import { useAuthStore } from "../store/useAuthStore";
@@ -10,6 +10,7 @@ import Logo from "../components/ui/Logo";
 import Avatar from "../components/ui/Avatar";
 import Spinner from "../components/ui/Spinner";
 import PasswordInput from "../components/PasswordInput";
+import { InstallAppSetting } from "../components/InstallApp";
 import { Link } from "react-router-dom";
 import { useEffect } from "react";
 import { Bell } from "lucide-react";
@@ -167,6 +168,11 @@ export default function Settings() {
         </section>
 
         <NotificationSettings />
+
+        <section className="card p-6">
+          <h2 className="mb-3 flex items-center gap-2 font-display font-semibold"><Smartphone size={18} className="text-indigo-300" /> App</h2>
+          <InstallAppSetting />
+        </section>
 
         <section className="card p-6">
           <h2 className="mb-5 flex items-center gap-2 font-display font-semibold"><KeyRound size={18} className="text-indigo-300" /> Password</h2>

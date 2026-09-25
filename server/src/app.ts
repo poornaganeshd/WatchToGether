@@ -13,7 +13,8 @@ import { getIceServers } from "./controllers/rtc";
 import { getPushConfig, subscribePush, unsubscribePush } from "./controllers/push";
 import { authenticate, AuthRequest } from "./middlewares/authMiddleware";
 import { rateLimit } from "./middlewares/rateLimit";
-import { getYouTubeConfig, popularYouTube, searchYouTube } from "./controllers/youtube";
+import { getYouTubeConfig, playlistYouTube, popularYouTube, searchYouTube } from "./controllers/youtube";
+import { clearWatchHistory, deleteWatchHistoryItem, getWatchHistory } from "./controllers/watchHistory";
 import { RoomManager } from "./managers/RoomManager";
 import { createAdapter } from "@socket.io/redis-adapter";
 import type { RedisClient } from "./infra/redis";
@@ -85,6 +86,10 @@ export const createApp = (options: { gracePeriodMs?: number; redis?: { pub: Redi
     searchYouTube
   );
   app.get("/api/youtube/popular", authenticate, popularYouTube);
+  app.get("/api/youtube/playlist", authenticate, rateLimit({ name: "yt-playlist", windowMs: 60 * 60 * 1000, max: 60, key: (req) => (req as AuthRequest).userId ?? null }), playlistYouTube);
+  app.get("/api/watch-history", authenticate, getWatchHistory);
+  app.delete("/api/watch-history", authenticate, clearWatchHistory);
+  app.delete("/api/watch-history/:id", authenticate, deleteWatchHistoryItem);
   app.post("/api/push/subscribe", authenticate, subscribePush);
   app.delete("/api/push/subscribe", authenticate, unsubscribePush);
 
