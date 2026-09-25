@@ -30,14 +30,14 @@ export function ReactionOverlay() {
   );
 }
 
-export function ReactionPicker({ roomId, className = "" }: { roomId: string; className?: string }) {
+export function ReactionPicker({ roomId, className = "", align = "right" }: { roomId: string; className?: string; align?: "right" | "center" }) {
   const sendReaction = useSocketStore((s) => s.sendReaction);
   const [open, setOpen] = useState(false);
 
   return (
     <div className={`relative ${className}`} onMouseLeave={() => setOpen(false)}>
       {open && (
-        <div className="absolute bottom-full right-0 mb-2 flex gap-0.5 rounded-full border border-white/10 bg-ink-900/95 p-1 shadow-2xl backdrop-blur-xl animate-scale-in">
+        <div className={`absolute bottom-full mb-2 flex gap-0.5 ${align === "center" ? "left-1/2 -translate-x-1/2" : "right-0"} rounded-full border border-white/10 bg-ink-900/95 p-1 shadow-2xl backdrop-blur-xl animate-scale-in`}>
           {REACTIONS.map((emoji) => (
             <button
               key={emoji}

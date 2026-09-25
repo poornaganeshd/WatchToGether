@@ -1,9 +1,10 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
-import { ArrowDown, ChevronDown, ChevronRight, ChevronUp, Clock, Crown, History, ListPlus, ListVideo, MessageSquare, Mic2, Play, Plus, SendHorizonal, Settings, Share2, Shield, ShieldOff, SkipForward, Trash2, Users, UserX, X } from "lucide-react";
+import { ArrowDown, ChevronDown, ChevronRight, ChevronUp, Clock, Crown, History, ListPlus, ListVideo, MessageSquare, Mic2, Play, SendHorizonal, Settings, Share2, Shield, ShieldOff, SkipForward, Trash2, Users, UserX, X } from "lucide-react";
 import { mentionsUser, useSocketStore, type Message, type QueueItem } from "../store/useSocketStore";
 import { useAudioStore } from "../store/useAudioStore";
 import { PollCard, PollComposer } from "./Polls";
-import { BarChart3, MicOff, Timer, Volume2, VolumeX } from "lucide-react";
+import YouTubeSearch from "./YouTubeSearch";
+import { BarChart3, MicOff, Search, Timer, Video, Volume2, VolumeX } from "lucide-react";
 import { timeAgo } from "../lib/format";
 import Avatar from "./ui/Avatar";
 
@@ -25,6 +26,10 @@ interface ChatPanelProps {
   onClose: () => void;
   onMakeCoHost: (socketId: string) => void;
   onKick: (socketId: string, name: string) => void;
+  /** "sidebar" (desktop, closable column) or "embedded" (phone layout, fills its container). */
+  variant?: "sidebar" | "embedded";
+  /** Extra tab for camera tiles (used by the phone layout). */
+  camerasTab?: { count: number; content: React.ReactNode };
 }
 
 const TYPING_IDLE_MS = 3000;
@@ -48,12 +53,15 @@ const formatTime = (iso: string) => new Date(iso).toLocaleTimeString([], { hour:
 
 export default function ChatPanel({
   roomId, currentUser, isHost, hostId, coHostIds, hostAnnouncementActive, onToggleAnnouncement, onSeek, getTimestamp,
-  onOpenInvite, onOpenSettings, onClose, onMakeCoHost, onKick,
+  onOpenInvite, onOpenSettings, onClose, onMakeCoHost, onKick, variant = "sidebar", camerasTab,
 }: ChatPanelProps) {
+  const embedded = variant === "embedded";
   const messages = useSocketStore((s) => s.messages);
   const participants = useSocketStore((s) => s.participants);
   const sendMessage = useSocketStore((s) => s.sendMessage);
   const setChatVisible = useSocketStore((s) => s.setChatVisible);
+  const unreadCount = useSocketStore((s) => s.unreadCount);
+  const unreadMentions = useSocketStore((s) => s.unreadMentions);
   const setTyping = useSocketStore((s) => s.setTyping);
   const typingUsers = useSocketStore((s) => s.typingUsers);
   const queue = useSocketStore((s) => s.queue);
@@ -77,8 +85,8 @@ export default function ChatPanel({
   const muteOf = (uid: string) => chatSettings.muted.find((m) => m.userId === uid && (m.until === null || m.until > now));
   const myMute = muteOf(currentUser.id) ?? null;
   const socket = useSocketStore((s) => s.socket);
-  const [tab, setTab] = useState<"chat" | "queue" | "people">("chat");
-  const [queueUrl, setQueueUrl] = useState("");
+  const [tab, setTab] = useState<"chat" | "queue" | "people" | "cameras">("chat");
+  const [queueView, setQueueView] = useState<"next" | "find">(() => (useSocketStore.getState().queue.length ? "next" : "find"));
   const isTypingRef = useRef(false);
   const typingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [input, setInput] = useState("");
@@ -86,10 +94,11 @@ export default function ChatPanel({
   const listRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
+  // Messages count as read only while the Chat tab is actually showing.
   useEffect(() => {
-    setChatVisible(true);
+    setChatVisible(tab === "chat");
     return () => setChatVisible(false);
-  }, [setChatVisible]);
+  }, [setChatVisible, tab]);
 
   const stopTyping = () => {
     if (typingTimerRef.current) clearTimeout(typingTimerRef.current);
@@ -119,14 +128,6 @@ export default function ChatPanel({
     typingTimerRef.current = setTimeout(stopTyping, TYPING_IDLE_MS);
   };
 
-  const handleAddToQueue = (e: React.FormEvent) => {
-    e.preventDefault();
-    let url = queueUrl.trim();
-    if (!url) return;
-    if (!/^https?:\/\//i.test(url)) url = `https://${url}`;
-    socket?.emit("queue_add", { roomId, url });
-    setQueueUrl("");
-  };
 
   const queueAction = (event: "queue_play" | "queue_remove", item: QueueItem) => socket?.emit(event, { roomId, itemId: item.id });
   const moveItem = (item: QueueItem, direction: "up" | "down") => socket?.emit("queue_move", { roomId, itemId: item.id, direction });
@@ -250,25 +251,39 @@ export default function ChatPanel({
   const canModerate = isHost;
 
   return (
-    <aside className="fixed inset-y-0 right-0 z-[9999] flex h-full w-full flex-col border-l border-white/5 bg-ink-900/95 shadow-2xl backdrop-blur-xl animate-slide-in-right md:relative md:z-20 md:w-80 lg:w-96">
+    <aside
+      className={
+        embedded
+          ? "flex h-full w-full flex-col bg-ink-900"
+          : "fixed inset-y-0 right-0 z-[9999] flex h-full w-full flex-col border-l border-white/5 bg-ink-900/95 shadow-2xl backdrop-blur-xl animate-slide-in-right md:relative md:z-20 md:w-80 lg:w-96"
+      }
+    >
       <div className="flex items-center justify-between gap-2 border-b border-white/5 px-3 py-2.5">
-        <div className="flex rounded-lg bg-white/[0.04] p-0.5">
+        <div className={`flex rounded-lg bg-white/[0.04] p-0.5 ${embedded ? "flex-1" : ""}`} role="tablist">
           {([
-            { id: "chat", label: "Chat", icon: MessageSquare },
-            { id: "queue", label: queue.length ? `Queue · ${queue.length}` : "Queue", icon: ListVideo },
-            { id: "people", label: `${people.length}`, icon: Users },
-          ] as const).map(({ id, label, icon: Icon }) => (
+            { id: "chat", label: "Chat", icon: MessageSquare, show: true },
+            { id: "queue", label: queue.length ? `Queue · ${queue.length}` : "Queue", icon: ListVideo, show: true },
+            { id: "people", label: `${people.length}`, icon: Users, show: true },
+            { id: "cameras", label: `${camerasTab?.count ?? 0}`, icon: Video, show: !!camerasTab },
+          ] as const).filter((t) => t.show).map(({ id, label, icon: Icon }) => (
             <button
               key={id}
+              role="tab"
+              aria-selected={tab === id}
               onClick={() => setTab(id)}
-              className={`flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-xs font-semibold transition-colors ${tab === id ? "bg-white/10 text-white" : "text-slate-400 hover:text-slate-200"}`}
-              aria-label={id === "people" ? `People, ${people.length}` : undefined}
+              className={`relative flex items-center justify-center gap-1.5 rounded-md px-2.5 py-1.5 text-xs font-semibold transition-colors ${embedded ? "flex-1 py-2" : ""} ${tab === id ? "bg-white/10 text-white" : "text-slate-400 hover:text-slate-200"}`}
+              aria-label={id === "people" ? `People, ${people.length}` : id === "cameras" ? `Cameras, ${label}` : undefined}
             >
               <Icon size={13} /> {label}
+              {embedded && id === "chat" && tab !== "chat" && unreadCount > 0 && (
+                <span className={`absolute -right-0.5 -top-0.5 min-w-[16px] rounded-full px-1 text-[9px] font-bold leading-4 ${unreadMentions > 0 ? "bg-amber-400 text-black" : "bg-fuchsia-500 text-white"}`}>
+                  {unreadMentions > 0 ? "@" : unreadCount > 9 ? "9+" : unreadCount}
+                </span>
+              )}
             </button>
           ))}
         </div>
-        <div className="flex items-center gap-0.5">
+        <div className={`flex items-center gap-0.5 ${embedded ? "hidden" : ""}`}>
           <button onClick={onOpenInvite} className="btn-ghost px-2 py-1.5" title="Invite people" aria-label="Invite people">
             <Share2 size={16} />
           </button>
@@ -281,7 +296,40 @@ export default function ChatPanel({
         </div>
       </div>
 
-      {isHost && (
+      {isHost && embedded && tab === "chat" && (
+        <div className="flex items-center gap-1.5 border-b border-white/5 px-3 py-1.5">
+          <button
+            onClick={onToggleAnnouncement}
+            className={`flex h-8 items-center gap-1.5 rounded-lg border px-2.5 text-[11px] font-semibold ${
+              hostAnnouncementActive ? "border-red-500/40 bg-red-500/15 text-red-300" : "border-white/10 bg-white/[0.03] text-slate-300"
+            }`}
+            aria-label={hostAnnouncementActive ? "Stop announcement" : "Host announcement"}
+          >
+            <Mic2 size={13} className={hostAnnouncementActive ? "animate-pulse" : ""} /> {hostAnnouncementActive ? "Stop" : "Announce"}
+          </button>
+          <button
+            onClick={() => setComposerOpen(true)}
+            disabled={!!poll && !poll.closed}
+            className="flex h-8 items-center gap-1.5 rounded-lg border border-white/10 bg-white/[0.03] px-2.5 text-[11px] font-semibold text-slate-300 disabled:opacity-40"
+          >
+            <BarChart3 size={13} /> Poll
+          </button>
+          <label className="flex h-8 min-w-0 flex-1 items-center gap-1 rounded-lg border border-white/10 bg-white/[0.03] px-2 text-[11px] text-slate-300">
+            <Timer size={13} className={`shrink-0 ${chatSettings.slowModeSeconds ? "text-amber-300" : "text-slate-400"}`} />
+            <select
+              value={chatSettings.slowModeSeconds}
+              onChange={(e) => socket?.emit("set_slow_mode", { roomId, seconds: Number(e.target.value) })}
+              className="min-w-0 flex-1 bg-transparent font-semibold focus:outline-none"
+              aria-label="Slow mode"
+            >
+              {[0, 5, 10, 30, 60].map((sec) => (
+                <option key={sec} value={sec} className="bg-ink-900">{sec ? `Slow ${sec}s` : "Slow mode off"}</option>
+              ))}
+            </select>
+          </label>
+        </div>
+      )}
+      {isHost && !embedded && (
         <div className="border-b border-white/5 px-3 py-2">
           <button
             onClick={onToggleAnnouncement}
@@ -440,18 +488,26 @@ export default function ChatPanel({
         </>
       ) : tab === "queue" ? (
         <div className="flex flex-1 flex-col overflow-hidden">
-          <form onSubmit={handleAddToQueue} className="flex gap-2 border-b border-white/5 p-3">
-            <input
-              value={queueUrl}
-              onChange={(e) => setQueueUrl(e.target.value)}
-              placeholder="Suggest a video link"
-              className="input py-2"
-              maxLength={2000}
-            />
-            <button type="submit" disabled={!queueUrl.trim()} className="btn-primary h-10 w-10 shrink-0 p-0" aria-label="Add to queue">
-              <Plus size={16} />
-            </button>
-          </form>
+          <div className="flex gap-1 border-b border-white/5 p-2" role="tablist" aria-label="Queue views">
+            {([
+              { id: "next", label: queue.length ? `Up next · ${queue.length}` : "Up next", icon: ListVideo },
+              { id: "find", label: "Find videos", icon: Search },
+            ] as const).map(({ id, label, icon: Icon }) => (
+              <button
+                key={id}
+                role="tab"
+                aria-selected={queueView === id}
+                onClick={() => setQueueView(id)}
+                className={`flex flex-1 items-center justify-center gap-1.5 rounded-lg py-1.5 text-xs font-semibold transition-colors ${queueView === id ? "bg-white/10 text-white" : "text-slate-400 hover:text-slate-200"}`}
+              >
+                <Icon size={13} /> {label}
+              </button>
+            ))}
+          </div>
+          {queueView === "find" ? (
+            <YouTubeSearch roomId={roomId} canPlay={isHost} />
+          ) : (
+          <>
           {queue.length > 0 && (
             <div className="flex items-center justify-between gap-2 border-b border-white/5 px-3 py-2">
               <div className="text-xs text-slate-400">
@@ -480,7 +536,7 @@ export default function ChatPanel({
               <div className="flex h-full flex-col items-center justify-center text-center text-slate-500">
                 <ListVideo size={28} className="mb-2 opacity-50" />
                 <p className="text-sm">The queue is empty</p>
-                <p className="max-w-[16rem] text-xs">Add links here. {isHost ? "The next one plays automatically when the current video ends." : "The host decides what plays next."}</p>
+                <p className="max-w-[16rem] text-xs">Use “Find videos” to search YouTube or paste a link. {isHost ? "The next one plays automatically when the current video ends." : "The host decides what plays next."}</p>
               </div>
             ) : (
               queue.map((item, index) => {
@@ -549,7 +605,11 @@ export default function ChatPanel({
               </div>
             )}
           </div>
+          </>
+          )}
         </div>
+      ) : tab === "cameras" && camerasTab ? (
+        <div className="min-h-0 flex-1 overflow-y-auto">{camerasTab.content}</div>
       ) : (
         <div className="flex-1 space-y-1 overflow-y-auto p-3">
           {people.map((p) => {

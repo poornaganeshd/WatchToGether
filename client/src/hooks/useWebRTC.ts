@@ -2,6 +2,11 @@ import { useEffect, useRef, useState } from "react";
 import { useSocketStore } from "../store/useSocketStore";
 import { useAuthStore } from "../store/useAuthStore";
 import { getIceServers } from "../lib/ice";
+import { toast } from "../store/useToastStore";
+
+/** Phones and tablets have no screen-capture API in the browser. */
+export const isScreenShareSupported = () =>
+  typeof navigator !== "undefined" && !!navigator.mediaDevices && typeof navigator.mediaDevices.getDisplayMedia === "function";
 import { classifyRemoteStream, type StreamStateContext } from "../utils/streamClassification";
 
 interface PeerConnection {
@@ -641,10 +646,13 @@ export function useWebRTC(roomId: string) {
     }
   };
 
+  // Tears down the current screen/file broadcast. Kept in a ref because track.stop() does NOT
+  // fire "ended" (that only happens when the browser ends the capture, e.g. its own "Stop
+  // sharing" bar), so the in-app stop button must call this directly.
+  const stopBroadcastRef = useRef<(() => void) | null>(null);
+
   const broadcastMediaStream = (stream: MediaStream) => {
-    if (screenStreamRef.current) {
-      screenStreamRef.current.getTracks().forEach(t => t.stop());
-    }
+    stopBroadcastRef.current?.();
 
     const videoTrack = stream.getVideoTracks()[0];
     if (!videoTrack) return;
@@ -662,8 +670,13 @@ export function useWebRTC(roomId: string) {
       });
     });
 
+    let cleanedUp = false;
     const cleanupBroadcast = () => {
+      if (cleanedUp) return;
+      cleanedUp = true;
       stream.getTracks().forEach((track) => {
+        track.onended = null;
+        track.stop();
         Object.values(peerConnections.current).forEach((pc) => {
           const sender = pc.getSenders().find((s) => s.track === track);
           if (sender) {
@@ -671,17 +684,27 @@ export function useWebRTC(roomId: string) {
           }
         });
       });
-      screenStreamRef.current = null;
-      setScreenStreamState(null);
+      if (screenStreamRef.current === stream) {
+        screenStreamRef.current = null;
+        setScreenStreamState(null);
+      }
+      if (stopBroadcastRef.current === cleanupBroadcast) stopBroadcastRef.current = null;
       socket?.emit("screen_share_stop", { roomId });
     };
 
+    stopBroadcastRef.current = cleanupBroadcast;
     videoTrack.onended = cleanupBroadcast;
   };
 
+  const stopBroadcast = () => stopBroadcastRef.current?.();
+
   const shareScreen = async () => {
     if (screenStreamRef.current) {
-      screenStreamRef.current.getTracks().forEach(t => t.stop());
+      stopBroadcast();
+      return;
+    }
+    if (!isScreenShareSupported()) {
+      toast.info("Screen sharing isn't available in mobile browsers. Use Chrome, Edge or Firefox on a computer to share your screen.");
       return;
     }
 
@@ -690,8 +713,15 @@ export function useWebRTC(roomId: string) {
       broadcastMediaStream(screenStream);
     } catch (err) {
       console.error("Error sharing screen:", err);
+      const name = err instanceof Error ? err.name : "";
+      // NotAllowedError also covers the user cancelling the picker: say nothing then.
+      if (name === "NotAllowedError" && /denied by system|permission/i.test((err as Error).message)) {
+        toast.error("Your system blocked screen capture. Allow screen recording for your browser in system settings.");
+      } else if (name !== "NotAllowedError" && name !== "AbortError") {
+        toast.error("Couldn't start screen sharing");
+      }
     }
   };
 
-  return { getLocalStream, localStream, localStreamState, screenStreamState, peers, peerStatuses, screenShares, toggleAudio, toggleVideo, shareScreen, broadcastMediaStream };
+  return { getLocalStream, localStream, localStreamState, screenStreamState, peers, peerStatuses, screenShares, toggleAudio, toggleVideo, shareScreen, broadcastMediaStream, stopBroadcast };
 }

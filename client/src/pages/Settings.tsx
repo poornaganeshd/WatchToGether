@@ -189,8 +189,23 @@ export default function Settings() {
             </button>
           </form>
         </section>
+        <BuildInfo />
       </main>
     </div>
+  );
+}
+
+function BuildInfo() {
+  const [server, setServer] = useState<{ commit: string; startedAt: string } | null | "error">(null);
+  useEffect(() => {
+    api.get("/health").then((r) => setServer(r.data)).catch(() => setServer("error"));
+  }, []);
+  return (
+    <p className="text-center text-[11px] text-slate-600">
+      App build <span className="font-mono text-slate-500">{__APP_COMMIT__}</span> · built{" "}
+      {new Date(__APP_BUILT_AT__).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" })} · Server{" "}
+      <span className="font-mono text-slate-500">{server === null ? "…" : server === "error" ? "unreachable" : server.commit}</span>
+    </p>
   );
 }
 

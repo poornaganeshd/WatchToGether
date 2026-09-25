@@ -8,7 +8,7 @@ import RemoteAudioManager from "../components/RemoteAudioManager";
 import { useWebRTC } from "../hooks/useWebRTC";
 import { useVoiceActivityDetection } from "../hooks/useVoiceActivityDetection";
 import { useAudioStore } from "../store/useAudioStore";
-import { Mic2, MessageSquare, Users, ChevronRight, Share2, LogOut, Copy, Check, WifiOff, SlidersHorizontal } from "lucide-react";
+import { Mic2, MessageSquare, Users, ChevronRight, Share2, LogOut, Copy, Check, WifiOff, SlidersHorizontal, Settings } from "lucide-react";
 import api, { getErrorMessage } from "../lib/api";
 import AudioSettingsModal from "../components/AudioSettingsModal";
 import InviteModal from "../components/InviteModal";
@@ -19,6 +19,8 @@ import PasswordPrompt from "../components/PasswordPrompt";
 import { ReactionOverlay, ReactionPicker } from "../components/Reactions";
 import CountdownOverlay from "../components/CountdownOverlay";
 import CameraPopout from "../components/CameraPopout";
+import MobileControlBar from "../components/MobileControlBar";
+import { useIsMobile } from "../lib/useMediaQuery";
 import { toast } from "../store/useToastStore";
 import { loadIceServers } from "../lib/ice";
 import { copyToClipboard, formatClock } from "../lib/format";
@@ -30,7 +32,7 @@ export default function Room() {
   const { user } = useAuthStore();
   const navigate = useNavigate();
   const { socket, connect, joinRoom, leaveRoom, clearMessages, connectionStatus, reconnectError, roomAccessError, endedRoomId, clearEndedRoom, unreadCount, unreadMentions, participants, exitReason, clearExitReason, roomInfo } = useSocketStore();
-  const { getLocalStream, localStream, localStreamState, screenStreamState, peers, peerStatuses, screenShares, toggleAudio, toggleVideo, shareScreen, broadcastMediaStream } = useWebRTC(id || "");
+  const { getLocalStream, localStream, localStreamState, screenStreamState, peers, peerStatuses, screenShares, toggleAudio, toggleVideo, shareScreen, broadcastMediaStream, stopBroadcast } = useWebRTC(id || "");
   const [isInviteModalOpen, setIsInviteModalOpen] = useState(false);
   const [mainScreenSource, setMainScreenSource] = useState<'url' | string>('url');
   const [roomCreatedAt, setRoomCreatedAt] = useState<string | null>(null);
@@ -38,6 +40,8 @@ export default function Room() {
   const [roomSettings, setRoomSettings] = useState<{ name: string; isPrivate: boolean; maxParticipants: number } | null>(null);
   const [isRoomSettingsOpen, setIsRoomSettingsOpen] = useState(false);
   const [isShortcutsOpen, setIsShortcutsOpen] = useState(false);
+  const [isHostControlsOpen, setIsHostControlsOpen] = useState(false);
+  const isMobile = useIsMobile();
   const [roomDisplayId, setRoomDisplayId] = useState<string | null>(null);
   const [roomName, setRoomName] = useState<string | null>(null);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
@@ -472,13 +476,73 @@ export default function Room() {
 
   const { hostAnnouncementActive } = useAudioStore();
 
+  const screenSourceSelect = (
+    <select
+      value={mainScreenSource}
+      onChange={(e) => {
+        pendingMainScreenSourceRef.current = null;
+        setMainScreenSource(e.target.value);
+      }}
+      className="rounded-xl border border-white/10 bg-ink-900/80 px-3 py-2 text-sm font-medium text-white shadow-lg backdrop-blur-md focus:border-indigo-400/60 focus:outline-none"
+      aria-label="Main screen source"
+    >
+      <option value="url">🎬 Video player</option>
+      {screenStreamState && <option value={screenStreamState.id}>🖥️ Your screen</option>}
+      {Object.entries(screenShares).map(([socketId, screenShareStream]) => {
+        const sId = typeof screenShareStream === "string" ? screenShareStream : (screenShareStream as MediaStream).id;
+        return (
+          <option key={sId} value={sId}>🖥️ {participantName(socketId)}'s screen</option>
+        );
+      })}
+    </select>
+  );
+  const hasScreenShares = !!screenStreamState || Object.keys(screenShares).length > 0;
+  const cameraCount = peers.length + 1;
+
   return (
-    <div className="flex h-screen bg-black overflow-hidden" ref={mainContainerRef}>
+    <div
+      className={isMobile ? "flex h-[100dvh] flex-col overflow-hidden bg-ink-950" : "flex h-screen bg-black overflow-hidden"}
+      ref={mainContainerRef}
+    >
       {/* Dedicated Remote WebRTC Audio Pipeline (decoupled from camera tiles/sidebar) */}
       <RemoteAudioManager peers={peers} />
 
+      {/* Phone: compact room header (hidden in landscape, where the video takes the whole screen) */}
+      {isMobile && !isFullscreen && (
+        <header className="flex shrink-0 items-center gap-2 border-b border-white/5 bg-ink-900/90 px-3 py-2 pt-[max(0.5rem,env(safe-area-inset-top))] landscape:hidden">
+          <div className="min-w-0 flex-1">
+            <p className="truncate text-sm font-semibold text-white">{roomName || "Room"}</p>
+            <p className="flex items-center gap-2 text-[11px] text-slate-400">
+              {roomDisplayId && (
+                <button onClick={handleCopyCode} className="flex items-center gap-1 font-mono text-slate-300" title="Copy room code">
+                  {roomDisplayId} {codeCopied ? <Check size={11} className="text-emerald-400" /> : <Copy size={11} />}
+                </button>
+              )}
+              <span className="flex items-center gap-1 font-mono">
+                <span className="h-1.5 w-1.5 rounded-full bg-red-500" /> {duration}
+              </span>
+            </p>
+          </div>
+          {hasScreenShares && <div className="max-w-[45%] [&_select]:w-full [&_select]:py-1.5 [&_select]:text-xs">{screenSourceSelect}</div>}
+          {isRoomHost && roomSettings && (
+            <button onClick={() => setIsRoomSettingsOpen(true)} className="btn-ghost p-2" aria-label="Room settings">
+              <SlidersHorizontal size={18} />
+            </button>
+          )}
+          <button onClick={() => setIsSettingsOpen(true)} className="btn-ghost p-2" aria-label="Audio settings">
+            <Settings size={18} />
+          </button>
+        </header>
+      )}
+
       {/* Main Video Area */}
-      <div className="flex-1 flex flex-col h-full relative z-0 bg-black">
+      <div
+        className={
+          isMobile
+            ? `relative z-0 w-full shrink-0 bg-black ${isFullscreen ? "h-full" : "aspect-video landscape:aspect-auto landscape:h-[100dvh]"}`
+            : "flex-1 flex flex-col h-full relative z-0 bg-black"
+        }
+      >
         <div 
           ref={videoContainerRef} 
           className={isFullscreen 
@@ -487,10 +551,14 @@ export default function Room() {
           }
           style={isFullscreen ? { width: '100vw', height: '100vh', maxWidth: 'none', maxHeight: 'none' } : undefined}
         >
-          {/* Edge Triggers (Always Active) */}
-          <div className="absolute top-0 left-0 right-0 h-4 z-[9999]" onMouseEnter={() => setHoverZones(p => ({ ...p, top: true }))} />
-          <div className="absolute top-0 bottom-0 right-0 w-4 z-[9999]" onMouseEnter={() => setHoverZones(p => ({ ...p, right: true }))} />
-          <div className="absolute bottom-0 left-0 right-0 h-4 z-[9999]" onMouseEnter={handleMouseEnterBottom} />
+          {/* Edge Triggers (desktop hover reveal) */}
+          {!isMobile && (
+            <>
+              <div className="absolute top-0 left-0 right-0 h-4 z-[9999]" onMouseEnter={() => setHoverZones(p => ({ ...p, top: true }))} />
+              <div className="absolute top-0 bottom-0 right-0 w-4 z-[9999]" onMouseEnter={() => setHoverZones(p => ({ ...p, right: true }))} />
+              <div className="absolute bottom-0 left-0 right-0 h-4 z-[9999]" onMouseEnter={handleMouseEnterBottom} />
+            </>
+          )}
           {hostAnnouncementActive && (
             <div className="absolute top-4 left-1/2 -translate-x-1/2 z-[9600] flex items-center gap-2 rounded-full border border-red-400/40 bg-red-600/90 px-5 py-2 text-sm font-semibold text-white shadow-[0_0_30px_rgba(220,38,38,0.5)] backdrop-blur animate-fade-up">
               <span className="relative flex h-2.5 w-2.5">
@@ -520,6 +588,8 @@ export default function Room() {
             </div>
           )}
 
+          {!isMobile && (
+          <>
           {/* Top Edge Overlay Area */}
           <div 
             className={`absolute top-0 left-0 right-0 h-32 z-[9000] transition-opacity duration-300 ${hoverZones.top ? 'opacity-100 pointer-events-auto' : 'opacity-0 md:pointer-events-none max-md:opacity-100 max-md:pointer-events-auto max-md:h-16'}`}
@@ -527,24 +597,7 @@ export default function Room() {
           >
             {/* Main Screen Selection Dropdown */}
             <div className="absolute top-4 left-4 z-50">
-              <select 
-                value={mainScreenSource}
-                onChange={(e) => {
-                  pendingMainScreenSourceRef.current = null;
-                  setMainScreenSource(e.target.value);
-                }}
-                className="rounded-xl border border-white/10 bg-ink-900/80 px-3 py-2 text-sm font-medium text-white shadow-lg backdrop-blur-md focus:border-indigo-400/60 focus:outline-none"
-                aria-label="Main screen source"
-              >
-                <option value="url">🎬 Video player</option>
-                {screenStreamState && <option value={screenStreamState.id}>🖥️ Your screen</option>}
-                {Object.entries(screenShares).map(([socketId, screenShareStream]) => {
-                  const sId = typeof screenShareStream === "string" ? screenShareStream : (screenShareStream as MediaStream).id;
-                  return (
-                    <option key={sId} value={sId}>🖥️ {participantName(socketId)}'s screen</option>
-                  );
-                })}
-              </select>
+              {screenSourceSelect}
             </div>
 
             {/* Room Info & Duration */}
@@ -578,6 +631,8 @@ export default function Room() {
               </div>
             </div>
           </div>
+          </>
+          )}
 
           {/* Main Screen Renderer */}
           {mainScreenSource === 'url' ? (
@@ -586,7 +641,7 @@ export default function Room() {
                 className={isFullscreen ? "w-[100vw] h-[100vh] max-w-none max-h-none flex-1 flex" : "w-full h-full flex-1 flex"}
                 style={isFullscreen ? { width: '100vw', height: '100vh', maxWidth: 'none', maxHeight: 'none' } : undefined}
               >
-                <VideoPlayer ref={videoPlayerRef} roomId={id} isFullscreen={isFullscreen} isHost={isHost} isRoomHost={isRoomHost} broadcastMediaStream={broadcastMediaStream} shareScreen={shareScreen} />
+                <VideoPlayer ref={videoPlayerRef} roomId={id} isFullscreen={isFullscreen} isHost={isHost} isRoomHost={isRoomHost} broadcastMediaStream={broadcastMediaStream} stopBroadcast={stopBroadcast} shareScreen={shareScreen} compact={isMobile} controlsSheetOpen={isHostControlsOpen} onControlsSheetClose={() => setIsHostControlsOpen(false)} />
               </div>
             ) : null
           ) : (
@@ -602,7 +657,7 @@ export default function Room() {
                     className={isFullscreen ? "w-[100vw] h-[100vh] max-w-none max-h-none flex-1 flex" : "w-full h-full flex-1 flex"}
                     style={isFullscreen ? { width: '100vw', height: '100vh', maxWidth: 'none', maxHeight: 'none' } : undefined}
                   >
-                    <VideoPlayer ref={videoPlayerRef} roomId={id} isFullscreen={isFullscreen} isHost={isHost} isRoomHost={isRoomHost} broadcastMediaStream={broadcastMediaStream} shareScreen={shareScreen} />
+                    <VideoPlayer ref={videoPlayerRef} roomId={id} isFullscreen={isFullscreen} isHost={isHost} isRoomHost={isRoomHost} broadcastMediaStream={broadcastMediaStream} stopBroadcast={stopBroadcast} shareScreen={shareScreen} compact={isMobile} controlsSheetOpen={isHostControlsOpen} onControlsSheetClose={() => setIsHostControlsOpen(false)} />
                   </div>
                 ) : null;
               }
@@ -629,6 +684,8 @@ export default function Room() {
             })()
           )}
 
+          {!isMobile && (
+          <>
           {/* Right Edge Overlay Area */}
           <div 
             className={`absolute top-0 right-0 bottom-0 w-32 z-[9000] flex flex-col items-end justify-center pr-4 transition-opacity duration-300 ${hoverZones.right ? 'opacity-100 pointer-events-auto' : 'opacity-0 md:pointer-events-none max-md:opacity-100 max-md:pointer-events-auto max-md:w-16'}`}
@@ -699,13 +756,15 @@ export default function Room() {
               </button>
             </div>
           </div>
+          </>
+          )}
 
           {/* Floating emoji reactions (inside the fullscreen container so they stay visible) */}
           <ReactionOverlay />
           {id && <CountdownOverlay roomId={id} canCancel={isHost} />}
           
           {/* Floating Cameras (rendered here so they overlay the video) */}
-          {id && (!isCameraSidebarOpen || isFullscreen) && (
+          {id && !isMobile && (!isCameraSidebarOpen || isFullscreen) && (
             <VideoGrid 
               localStream={localStreamState || localStream.current} 
               screenStream={screenStreamState} 
@@ -727,8 +786,70 @@ export default function Room() {
         </div>
       </div>
       
+      {/* Phone: tabbed panel + control bar under the video (hidden in landscape) */}
+      {isMobile && !isFullscreen && id && user && (
+        <>
+          <div className="min-h-0 flex-1 landscape:hidden">
+            <ChatPanel
+              variant="embedded"
+              roomId={id}
+              currentUser={user}
+              isHost={isHost}
+              hostId={hostId}
+              coHostIds={coHostIds}
+              hostAnnouncementActive={hostAnnouncementActive}
+              onToggleAnnouncement={toggleHostAnnouncement}
+              onSeek={handleSeekToTime}
+              getTimestamp={getTimestamp}
+              onOpenInvite={() => setIsInviteModalOpen(true)}
+              onOpenSettings={() => setIsSettingsOpen(true)}
+              onClose={() => undefined}
+              onMakeCoHost={(targetSocketId) => socket?.emit("make_cohost", { roomId: id, targetSocketId })}
+              onKick={(targetSocketId, name) => {
+                if (confirm(`Remove ${name} from this room? They can't rejoin until you allow them back in room settings.`)) {
+                  socket?.emit("kick_participant", { roomId: id, targetSocketId });
+                }
+              }}
+              camerasTab={{
+                count: cameraCount,
+                content: (
+                  <VideoGrid
+                    localStream={localStreamState || localStream.current}
+                    screenStream={screenStreamState}
+                    peers={peers}
+                    peerStatuses={peerStatuses}
+                    screenShares={screenShares}
+                    toggleAudio={toggleAudio}
+                    toggleVideo={toggleVideo}
+                    shareScreen={shareScreen}
+                    toggleFullscreen={toggleFullscreen}
+                    isFullscreen={isFullscreen}
+                    floating={false}
+                    isHost={isHost}
+                    roomId={id}
+                  />
+                ),
+              }}
+            />
+          </div>
+          <MobileControlBar
+            roomId={id}
+            localStream={localStreamState || localStream.current}
+            isHost={isHost}
+            onToggleAudio={toggleAudio}
+            onToggleVideo={toggleVideo}
+            onShareScreen={shareScreen}
+            isSharingScreen={!!screenStreamState}
+            onOpenHostControls={() => setIsHostControlsOpen(true)}
+            onInvite={() => setIsInviteModalOpen(true)}
+            onLeave={() => navigate('/dashboard')}
+            onFullscreen={toggleFullscreen}
+          />
+        </>
+      )}
+
       {/* Camera Sidebar */}
-      {!isFullscreen && isCameraSidebarOpen && (
+      {!isMobile && !isFullscreen && isCameraSidebarOpen && (
         <div className="fixed md:relative right-0 w-full md:w-64 h-full bg-ink-900/95 border-l border-white/5 flex flex-col shadow-2xl z-[9999] md:z-10 animate-slide-in-right backdrop-blur-xl">
           <div className="px-3 py-2.5 border-b border-white/5 flex justify-between items-center">
             <span className="font-semibold text-slate-200 text-sm flex items-center gap-2">
@@ -762,7 +883,7 @@ export default function Room() {
       )}
 
       {/* Live Chat Sidebar */}
-      {!isFullscreen && isChatOpen && id && user && (
+      {!isMobile && !isFullscreen && isChatOpen && id && user && (
         <ChatPanel
           roomId={id}
           currentUser={user}
