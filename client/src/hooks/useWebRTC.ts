@@ -621,6 +621,8 @@ export function useWebRTC(roomId: string) {
       localStorage.setItem('wt_pref_mic', String(audioTrack.enabled));
       const cam = localStream.current.getVideoTracks()[0]?.enabled ?? false;
       socket?.emit("participant_status", { roomId, cam, mic: audioTrack.enabled });
+      // Flipping track.enabled doesn't re-render anything; the mute buttons read it from the stream.
+      setLocalStreamState(new MediaStream(localStream.current.getTracks()));
     } else {
       try {
         const audioStream = await navigator.mediaDevices.getUserMedia({ audio: true });

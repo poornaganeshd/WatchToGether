@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Check, Link2, ListPlus, Play, Radio, Search, TrendingUp } from "lucide-react";
 import api, { getErrorMessage } from "../lib/api";
 import { formatClock } from "../lib/format";
@@ -21,7 +21,17 @@ const loadEnabled = () =>
   (configPromise ??= api
     .get("/youtube/config")
     .then((r) => !!r.data.enabled)
-    .catch(() => false));
+    .catch(() => {
+      // Don't remember a network blip: try again next time the panel opens.
+      configPromise = null;
+      return false;
+    }));
+
+// YouTube paging can repeat a video across pages; keep the first copy.
+const mergeUnique = (prev: Result[], next: Result[]) => {
+  const seen = new Set(prev.map((r) => r.id));
+  return [...prev, ...next.filter((r) => !seen.has(r.id) && seen.add(r.id))];
+};
 
 const looksLikeUrl = (text: string) => /^(https?:\/\/|www\.|youtu\.be\/|youtube\.com\/|m\.youtube\.com\/)/i.test(text.trim());
 const normalizeUrl = (text: string) => (/^https?:\/\//i.test(text.trim()) ? text.trim() : `https://${text.trim()}`);
@@ -39,7 +49,20 @@ export default function YouTubeSearch({ roomId, canPlay }: { roomId: string; can
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // Only the newest request may update the list, so a slow "Popular" load can't replace search results.
+  const requestSeq = useRef(0);
+
   const queued = new Set(queue.map((q) => q.url));
+
+  // Confirm only once the server has actually queued it (it can refuse: queue full, too fast).
+  const pendingAdds = useRef(new Map<string, string | undefined>());
+  useEffect(() => {
+    for (const [url, title] of pendingAdds.current) {
+      if (!queue.some((q) => q.url === url)) continue;
+      pendingAdds.current.delete(url);
+      toast.success(title ? `Added “${title.slice(0, 40)}” to the queue` : "Added to the queue");
+    }
+  }, [queue]);
 
   useEffect(() => {
     let cancelled = false;
@@ -47,14 +70,16 @@ export default function YouTubeSearch({ roomId, canPlay }: { roomId: string; can
       if (cancelled) return;
       setEnabled(on);
       if (!on) return;
+      const seq = ++requestSeq.current;
+      const isCurrent = () => !cancelled && seq === requestSeq.current;
       setLoading(true);
       // Region from the browser locale, e.g. en-IN -> IN.
       const region = (navigator.language.split("-")[1] || "US").toUpperCase();
       api
         .get("/youtube/popular", { params: { region } })
-        .then((r) => !cancelled && setResults(r.data.results))
-        .catch((err) => !cancelled && setError(getErrorMessage(err, "Couldn't load popular videos")))
-        .finally(() => !cancelled && setLoading(false));
+        .then((r) => isCurrent() && setResults(r.data.results))
+        .catch((err) => isCurrent() && setError(getErrorMessage(err, "Couldn't load popular videos")))
+        .finally(() => isCurrent() && setLoading(false));
     });
     return () => {
       cancelled = true;
@@ -62,24 +87,26 @@ export default function YouTubeSearch({ roomId, canPlay }: { roomId: string; can
   }, []);
 
   const runSearch = async (query: string, pageToken?: string) => {
+    const seq = ++requestSeq.current;
     setLoading(true);
     setError(null);
     try {
       const r = await api.get("/youtube/search", { params: { q: query, ...(pageToken ? { pageToken } : {}) } });
-      setResults((prev) => (pageToken ? [...prev, ...r.data.results] : r.data.results));
+      if (seq !== requestSeq.current) return;
+      setResults((prev) => (pageToken ? mergeUnique(prev, r.data.results) : r.data.results));
       setNextPage(r.data.nextPageToken);
       setHeading("search");
       setLastQuery(query);
     } catch (err) {
-      setError(getErrorMessage(err, "Search failed"));
+      if (seq === requestSeq.current) setError(getErrorMessage(err, "Search failed"));
     } finally {
-      setLoading(false);
+      if (seq === requestSeq.current) setLoading(false);
     }
   };
 
   const addToQueue = (url: string, title?: string) => {
+    pendingAdds.current.set(url, title);
     socket?.emit("queue_add", { roomId, url });
-    toast.success(title ? `Added “${title.slice(0, 40)}” to the queue` : "Added to the queue");
   };
 
   const playNow = (url: string) => {

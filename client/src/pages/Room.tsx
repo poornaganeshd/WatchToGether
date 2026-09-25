@@ -91,6 +91,9 @@ export default function Room() {
             target.requestFullscreen().catch((err) => console.error("Fullscreen request error:", err));
           } else if ('webkitRequestFullscreen' in target) {
             (target as HTMLDivElement & { webkitRequestFullscreen: () => Promise<void> }).webkitRequestFullscreen();
+          } else {
+            // iPhone Safari only allows full screen for <video>, not page elements.
+            toast.info("Turn your phone sideways to watch full screen");
           }
         }
       } else {

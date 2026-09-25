@@ -112,6 +112,13 @@ async function run() {
     r = await get("/youtube/search?q=cartoons");
     assert(r.status === 200 && calls.length === before, "Repeat searches are served from cache (case-insensitive)");
 
+    const beforeBurst = calls.filter((c) => c.path.endsWith("/search")).length;
+    const burst = await Promise.all([get("/youtube/search?q=same+time"), get("/youtube/search?q=Same+Time")]);
+    assert(
+      burst.every((b) => b.status === 200) && calls.filter((c) => c.path.endsWith("/search")).length === beforeBurst + 1,
+      "Identical searches at the same moment share one API call"
+    );
+
     console.log("\n--- Popular ---");
     r = await get("/youtube/popular?region=GB");
     assert(r.status === 200 && r.json.results.length === 1 && r.json.results[0].id === "pop1", "Popular feed drops non-embeddable videos", r.json);

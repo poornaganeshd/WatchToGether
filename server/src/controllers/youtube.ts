@@ -21,25 +21,47 @@ export interface YouTubeResult {
 }
 
 const memoryCache = new Map<string, { expires: number; value: unknown }>();
+// Identical requests arriving together share one API call (each search costs 100 quota units).
+const inFlight = new Map<string, Promise<unknown>>();
+
+const readShared = async (key: string): Promise<string | null> => {
+  try {
+    return (await getRedis()?.get(`yt:${key}`)) ?? null;
+  } catch (err) {
+    console.warn("YouTube cache read failed, using memory cache:", err);
+    return null;
+  }
+};
+
+const writeShared = async (key: string, value: unknown, ttlSeconds: number) => {
+  try {
+    await getRedis()?.set(`yt:${key}`, JSON.stringify(value), { EX: ttlSeconds });
+  } catch (err) {
+    console.warn("YouTube cache write failed:", err);
+  }
+};
 
 const cached = async <T>(key: string, ttlSeconds: number, load: () => Promise<T>): Promise<T> => {
-  const redis = getRedis();
-  if (redis) {
-    const hit = await redis.get(`yt:${key}`);
-    if (hit) return JSON.parse(hit) as T;
-    const value = await load();
-    await redis.set(`yt:${key}`, JSON.stringify(value), { EX: ttlSeconds });
-    return value;
-  }
-  const hit = memoryCache.get(key);
-  if (hit && hit.expires > Date.now()) return hit.value as T;
-  const value = await load();
-  memoryCache.set(key, { expires: Date.now() + ttlSeconds * 1000, value });
-  if (memoryCache.size > 500) {
-    const now = Date.now();
-    for (const [k, v] of memoryCache) if (v.expires <= now) memoryCache.delete(k);
-  }
-  return value;
+  const local = memoryCache.get(key);
+  if (local && local.expires > Date.now()) return local.value as T;
+  const shared = await readShared(key);
+  if (shared) return JSON.parse(shared) as T;
+
+  const pending = inFlight.get(key);
+  if (pending) return pending as Promise<T>;
+  const request = load()
+    .then(async (value) => {
+      memoryCache.set(key, { expires: Date.now() + ttlSeconds * 1000, value });
+      if (memoryCache.size > 500) {
+        const now = Date.now();
+        for (const [k, v] of memoryCache) if (v.expires <= now) memoryCache.delete(k);
+      }
+      await writeShared(key, value, ttlSeconds);
+      return value;
+    })
+    .finally(() => inFlight.delete(key));
+  inFlight.set(key, request);
+  return request;
 };
 
 class YouTubeApiError extends Error {
