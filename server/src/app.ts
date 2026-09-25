@@ -5,13 +5,17 @@ import { Server } from "socket.io";
 import authRoutes from "./routes/auth";
 import roomRoutes from "./routes/room";
 import friendRoutes from "./routes/friend";
+import inviteRoutes from "./routes/invites";
 import { setupSocketHandlers } from "./socket";
 import { getAvatar } from "./controllers/auth";
 import { getIceServers } from "./controllers/rtc";
+import { getPushConfig, subscribePush, unsubscribePush } from "./controllers/push";
 import { authenticate } from "./middlewares/authMiddleware";
 import { RoomManager } from "./managers/RoomManager";
+import { createAdapter } from "@socket.io/redis-adapter";
+import type { RedisClient } from "./infra/redis";
 
-export const createApp = (options: { gracePeriodMs?: number } = {}) => {
+export const createApp = (options: { gracePeriodMs?: number; redis?: { pub: RedisClient; sub: RedisClient } | null } = {}) => {
   const app = express();
   const httpServer = createServer(app);
   // Comma-separated list of allowed origins; defaults to allowing any origin.
@@ -27,6 +31,11 @@ export const createApp = (options: { gracePeriodMs?: number } = {}) => {
     // Room subtitle files are sent over the socket.
     maxHttpBufferSize: 2e6,
   });
+
+  // With Redis, broadcasts (room events, notifications) reach sockets on every instance.
+  if (options.redis) {
+    io.adapter(createAdapter(options.redis.pub, options.redis.sub));
+  }
 
   // Behind a reverse proxy (Render, Fly, nginx…) set TRUST_PROXY=1 so rate limits see real client IPs.
   if (process.env.TRUST_PROXY) {
@@ -44,8 +53,12 @@ export const createApp = (options: { gracePeriodMs?: number } = {}) => {
   app.use("/api/auth", authRoutes);
   app.use("/api/rooms", roomRoutes);
   app.use("/api/friends", friendRoutes);
+  app.use("/api/invites", inviteRoutes);
   app.get("/api/users/:id/avatar", getAvatar);
   app.get("/api/rtc/ice-servers", authenticate, getIceServers);
+  app.get("/api/push/config", getPushConfig);
+  app.post("/api/push/subscribe", authenticate, subscribePush);
+  app.delete("/api/push/subscribe", authenticate, unsubscribePush);
 
   app.get("/", (req, res) => {
     res.send("CineSync API");

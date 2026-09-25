@@ -1,6 +1,9 @@
 import { Request, Response, NextFunction } from "express";
+import { incrementWindow } from "../infra/counterStore";
 
 interface RateLimitOptions {
+  /** Stable, unique name: counters are shared across instances by name. */
+  name: string;
   windowMs: number;
   max: number;
   /** Derives the bucket key; return null to skip limiting for this request. */
@@ -8,29 +11,22 @@ interface RateLimitOptions {
   message?: string;
 }
 
-// Fixed-window, in-memory limiter. Good enough for a single server instance; use a shared
-// store (e.g. Redis) if the API is scaled horizontally.
-export const rateLimit = ({ windowMs, max, key, message }: RateLimitOptions) => {
-  const buckets = new Map<string, { count: number; resetAt: number }>();
-
-  const sweep = setInterval(() => {
-    const now = Date.now();
-    for (const [k, b] of buckets) if (b.resetAt <= now) buckets.delete(k);
-  }, Math.min(windowMs, 60_000));
-  sweep.unref();
-
-  return (req: Request, res: Response, next: NextFunction): void => {
+// Fixed-window limiter backed by the shared counter store (Redis when configured, so limits
+// hold across API instances; process memory otherwise).
+export const rateLimit = ({ name, windowMs, max, key, message }: RateLimitOptions) => {
+  return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
     const k = key(req);
     if (!k) return next();
-    const now = Date.now();
-    let bucket = buckets.get(k);
-    if (!bucket || bucket.resetAt <= now) {
-      bucket = { count: 0, resetAt: now + windowMs };
-      buckets.set(k, bucket);
+    let bucket: { count: number; resetAt: number };
+    try {
+      bucket = await incrementWindow(`${name}:${k}`, windowMs);
+    } catch (err) {
+      // Fail open: a counter outage shouldn't take sign-in down with it.
+      console.error("Rate limit store failed:", err);
+      return next();
     }
-    bucket.count++;
     if (bucket.count > max) {
-      const retryAfter = Math.ceil((bucket.resetAt - now) / 1000);
+      const retryAfter = Math.max(1, Math.ceil((bucket.resetAt - Date.now()) / 1000));
       res.setHeader("Retry-After", String(retryAfter));
       res.status(429).json({ error: message || `Too many attempts. Try again in ${Math.ceil(retryAfter / 60)} minute(s).` });
       return;

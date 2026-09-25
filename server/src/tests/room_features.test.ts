@@ -15,7 +15,8 @@ process.env.JWT_SECRET = JWT_SECRET;
 let testsPassed = 0;
 let testsFailed = 0;
 
-function assert(condition: boolean, testName: string, detail?: string) {
+function assert(condition: boolean, testName: string, rawDetail?: unknown) {
+  const detail = rawDetail === undefined || typeof rawDetail === "string" ? rawDetail : JSON.stringify(rawDetail);
   if (condition) {
     console.log(`  [PASS] ${testName}`);
     testsPassed++;
@@ -296,7 +297,156 @@ async function runTests() {
     await wait(300);
     assert(guest.last("error")?.message === "Nothing is queued to skip to", "Can't vote to skip with an empty queue");
 
-    console.log("\n--- Test 19: Evicting a room notifies everyone ---");
+    console.log("\n--- Test 19: Recently played ---");
+    const recent = host.last("recently_played") as { url: string }[];
+    assert(Array.isArray(recent) && recent[0]?.url === "https://example.com/next.mp4", "Video changes are recorded as recently played", recent);
+
+    console.log("\n--- Test 20: Only http(s) video URLs ---");
+    host.socket.emit("change_video", { roomId: privateRoomId, url: "javascript:alert(1)" });
+    await wait(300);
+    assert(roomManager.getRoom(privateRoomId)?.playback.url === "https://example.com/next.mp4", "javascript: URLs are rejected");
+
+    console.log("\n--- Test 21: Countdown start ---");
+    guest.socket.emit("start_countdown", { roomId: privateRoomId, seconds: 3 }); // guest is a co-host here
+    await wait(300);
+    const cd = host.last("countdown");
+    assert(typeof cd?.endsAt === "number" && cd.endsAt - Date.now() > 2000, "Co-host can start a countdown everyone sees", cd);
+    assert(host.last("pause_video") !== undefined && roomManager.getRoom(privateRoomId)?.playback.playing === false, "Countdown pauses everyone first");
+    host.socket.emit("start_countdown", { roomId: privateRoomId, seconds: 3 });
+    await wait(200);
+    assert(host.last("error")?.message === "A countdown is already running", "Only one countdown at a time");
+    await wait(3000);
+    assert(host.last("countdown") === null && guest.last("play_video") !== undefined, "Playback starts for everyone when it ends");
+    assert(roomManager.getRoom(privateRoomId)?.playback.playing === true, "Server state is playing after the countdown");
+
+    host.socket.emit("start_countdown", { roomId: privateRoomId, seconds: 5 });
+    await wait(200);
+    host.socket.emit("cancel_countdown", { roomId: privateRoomId });
+    await wait(300);
+    assert(guest.last("countdown") === null && roomManager.getCountdownEndsAt(privateRoomId) === null, "Countdowns can be cancelled");
+
+    console.log("\n--- Test 22: Deleting chat messages ---");
+    host.socket.emit("send_message", { roomId: privateRoomId, userId: hostId, userName: "Host Person", content: "delete me" });
+    await wait(400);
+    const toDelete = guest.last("receive_message");
+    // Wait out the chat limiter from the flood test before the guest posts again.
+    await wait(5000);
+    guest.socket.emit("send_message", { roomId: privateRoomId, userId: guestId, userName: "Guest Person", content: "mine" });
+    await wait(400);
+    const guestMsg = host.last("receive_message");
+    host.socket.emit("delete_message", { roomId: privateRoomId, messageId: toDelete.id });
+    guest.socket.emit("delete_message", { roomId: privateRoomId, messageId: guestMsg.id });
+    await wait(400);
+    const deletedIds = (guest.events["message_deleted"] || []).map((e: { id: string }) => e.id);
+    assert(deletedIds.includes(toDelete.id) && deletedIds.includes(guestMsg.id), "Hosts and authors can delete messages");
+    assert(!(await prisma.message.findUnique({ where: { id: toDelete.id } })), "Deleted messages are removed from the database");
+
+    console.log("\n--- Test 23: Removing a co-host ---");
+    guest.socket.emit("remove_cohost", { roomId: privateRoomId, targetUserId: guestId });
+    await wait(400);
+    assert(host.last("cohost_removed")?.userId === guestId && !roomManager.isAuthorized(privateRoomId, guestId), "Co-hosts can step down");
+    const stillCo = await prisma.roomCoHost.findUnique({ where: { roomId_userId: { roomId: privateRoomId, userId: guestId } } });
+    assert(!stillCo, "Co-host removal is saved");
+    guest.socket.emit("delete_message", { roomId: privateRoomId, messageId: "x".repeat(10) });
+    guest.socket.emit("start_countdown", { roomId: privateRoomId, seconds: 3 });
+    await wait(300);
+    assert(roomManager.getCountdownEndsAt(privateRoomId) === null, "Former co-hosts lose host controls");
+
+    console.log("\n--- Test 24: Long display names can join ---");
+    const longName = "L".repeat(90);
+    await prisma.user.update({ where: { id: outsiderId }, data: { name: longName } });
+    roomManager.getRoom(privateRoomId)!.bannedUserIds.clear();
+    roomManager.updateSettings(privateRoomId, { maxParticipants: 10 });
+    const longClient = new TestClient(outsiderId, longName, url, jwt.sign({ userId: outsiderId }, JWT_SECRET));
+    await longClient.connect();
+    await longClient.join(privateRoomId, "secret");
+    assert(!!longClient.last("room_state"), "A 90-character name can join", longClient.last("error"));
+
+    console.log("\n--- Test 25: A socket is only in one room ---");
+    await longClient.join(otherRoomId);
+    assert(!roomManager.getRoom(privateRoomId)?.participants.has(longClient.socket.id!), "Joining another room leaves the first");
+    assert(roomManager.getRoom(otherRoomId)?.participants.has(longClient.socket.id!) === true, "…and joins the second");
+    longClient.disconnect();
+
+    console.log("\n--- Test 26: Room password attempts are throttled ---");
+    const guesser = new TestClient(outsiderId, longName, url, jwt.sign({ userId: outsiderId }, JWT_SECRET));
+    await guesser.connect();
+    for (let i = 0; i < 10; i++) {
+      guesser.socket.emit("join_room", { roomId: privateRoomId, userId: outsiderId, userName: "x", password: `guess${i}` });
+    }
+    await wait(1500);
+    await guesser.join(privateRoomId, "secret");
+    assert(guesser.last("error")?.message?.startsWith("Too many password attempts"), "Even the right password is refused after 10 wrong guesses", guesser.last("error"));
+    guesser.disconnect();
+
+    console.log("\n--- Test 27: Chat replay capture ---");
+    await wait(5000); // let the chat limiter window pass
+    const playing = roomManager.getRoom(privateRoomId)!;
+    roomManager.updatePlayback(privateRoomId, { url: "https://example.com/replay.mp4", time: 42, playing: false });
+    host.socket.emit("send_message", { roomId: privateRoomId, userId: hostId, userName: "Host Person", content: "at 42s" });
+    await wait(500);
+    const replayMsg = await prisma.message.findFirst({ where: { roomId: privateRoomId, content: "at 42s" } });
+    assert(replayMsg?.videoUrl === "https://example.com/replay.mp4" && replayMsg.videoTime === 42, "Messages record the video and position", replayMsg);
+    void playing;
+
+    console.log("\n--- Test 28: Polls ---");
+    host.socket.emit("poll_create", { roomId: privateRoomId, question: "Next?", options: ["https://example.com/p1.mp4", "https://example.com/p2.mp4"], queueWinner: true });
+    await wait(300);
+    const poll = guest.last("poll_updated");
+    assert(poll?.question === "Next?" && poll.counts.join() === "0,0" && !poll.closed, "Host can start a poll everyone sees", poll);
+    host.socket.emit("poll_create", { roomId: privateRoomId, question: "Again", options: ["a", "b"] });
+    await wait(300);
+    assert(host.last("error")?.message === "Close the current poll before starting another", "Only one open poll at a time");
+    guest.socket.emit("poll_create", { roomId: privateRoomId, question: "Mine", options: ["a", "b"] });
+    await wait(200);
+    assert(host.last("poll_updated")?.question === "Next?", "Viewers can't start polls");
+    guest.socket.emit("poll_vote", { roomId: privateRoomId, pollId: poll.id, option: 1 });
+    host.socket.emit("poll_vote", { roomId: privateRoomId, pollId: poll.id, option: 1 });
+    await wait(300);
+    assert(host.last("poll_updated")?.counts.join() === "0,2", "Votes are counted", host.last("poll_updated"));
+    assert(guest.last("poll_my_vote") === 1, "Voters learn their own choice");
+    guest.socket.emit("poll_vote", { roomId: privateRoomId, pollId: poll.id, option: 0 });
+    await wait(300);
+    assert(host.last("poll_updated")?.counts.join() === "1,1" && host.last("poll_updated")?.totalVotes === 2, "Changing a vote moves it");
+    host.socket.emit("poll_vote", { roomId: privateRoomId, pollId: poll.id, option: 0 });
+    await wait(200);
+    host.socket.emit("poll_close", { roomId: privateRoomId, pollId: poll.id });
+    await wait(400);
+    const closedPoll = guest.last("poll_updated");
+    assert(closedPoll?.closed === true && closedPoll.winner === 0, "Closing picks the winner", closedPoll);
+    assert(roomManager.getQueue(privateRoomId).some((q) => q.url === "https://example.com/p1.mp4"), "Queue polls add the winner to the queue");
+    host.socket.emit("poll_create", { roomId: privateRoomId, question: "Bad", options: ["not a link", "x"], queueWinner: true });
+    await wait(200);
+    assert(guest.last("poll_updated")?.id === poll.id, "Queue polls require links");
+
+    console.log("\n--- Test 29: Mute and slow mode ---");
+    host.socket.emit("mute_user", { roomId: privateRoomId, targetUserId: guestId, minutes: 5 });
+    await wait(300);
+    const settings = guest.last("chat_settings");
+    assert(settings?.muted?.some((m: { userId: string; until: number }) => m.userId === guestId && m.until > Date.now()), "Muted users are listed with an expiry", settings);
+    guest.socket.emit("send_message", { roomId: privateRoomId, userId: guestId, userName: "Guest Person", content: "can you hear me" });
+    await wait(300);
+    assert(/muted/.test(guest.last("chat_rate_limited")?.message ?? "") && host.last("receive_message")?.content !== "can you hear me", "Muted users can't chat");
+    host.socket.emit("mute_user", { roomId: privateRoomId, targetUserId: guestId, minutes: 0 });
+    host.socket.emit("set_slow_mode", { roomId: privateRoomId, seconds: 10 });
+    await wait(300);
+    assert(guest.last("chat_settings")?.slowModeSeconds === 10 && guest.last("chat_settings")?.muted.length === 0, "Unmute and slow mode are broadcast");
+    guest.socket.emit("send_message", { roomId: privateRoomId, userId: guestId, userName: "Guest Person", content: "first" });
+    await wait(300);
+    guest.socket.emit("send_message", { roomId: privateRoomId, userId: guestId, userName: "Guest Person", content: "second" });
+    await wait(300);
+    assert(host.last("receive_message")?.content === "first" && /Slow mode/.test(guest.last("chat_rate_limited")?.message ?? ""), "Slow mode spaces out viewer messages");
+    host.socket.emit("send_message", { roomId: privateRoomId, userId: hostId, userName: "Host Person", content: "host1" });
+    await wait(200);
+    host.socket.emit("send_message", { roomId: privateRoomId, userId: hostId, userName: "Host Person", content: "host2" });
+    await wait(300);
+    assert(guest.last("receive_message")?.content === "host2", "Hosts aren't slowed down");
+    guest.socket.emit("mute_user", { roomId: privateRoomId, targetUserId: hostId, minutes: 5 });
+    await wait(200);
+    assert(roomManager.getChatSettings(privateRoomId).muted.length === 0, "Viewers can't mute anyone");
+    host.socket.emit("set_slow_mode", { roomId: privateRoomId, seconds: 0 });
+
+    console.log("\n--- Test 30: Evicting a room notifies everyone ---");
     roomManager.evictRoom(privateRoomId);
     await wait(300);
     assert(guest.last("room_ended")?.roomId === privateRoomId, "Participants receive room_ended");

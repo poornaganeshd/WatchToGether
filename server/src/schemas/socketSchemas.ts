@@ -8,14 +8,14 @@ export const joinGlobalRoomSchema = z.object({
 export const joinRoomSchema = z.object({
   roomId: z.string().uuid(),
   userId: z.string().uuid(),
-  userName: z.string().min(1).max(50),
+  userName: z.string().min(1).max(100),
   password: z.string().optional(),
 });
 
 export const sendMessageSchema = z.object({
   roomId: z.string().uuid(),
   userId: z.string().uuid(),
-  userName: z.string().min(1).max(50),
+  userName: z.string().min(1).max(100),
   content: z.string().min(1).max(1000), // Max 1000 chars for chat
 });
 
@@ -32,7 +32,8 @@ export const syncTimeSchema = z.object({
 
 export const changeVideoSchema = z.object({
   roomId: z.string().uuid(),
-  url: z.string().url().or(z.literal("")),
+  // Only http(s): other schemes (javascript:, data:, file:) have no business in a player.
+  url: z.string().trim().max(2000).url().refine((u) => /^https?:\/\//i.test(u), "Only http(s) links are supported").or(z.literal("")),
 });
 
 export const syncResponseSchema = z.object({
@@ -116,6 +117,56 @@ export const playbackReportSchema = z.object({
   roomId: z.string().uuid(),
   state: z.enum(["synced", "drifting", "buffering", "error"]),
   drift: z.number().finite().min(-86400).max(86400),
+});
+
+export const countdownSchema = z.object({
+  roomId: z.string().uuid(),
+  seconds: z.number().int().min(3).max(10),
+});
+
+export const deleteMessageSchema = z.object({
+  roomId: z.string().uuid(),
+  messageId: z.string().min(1).max(100),
+});
+
+export const targetUserSchema = z.object({
+  roomId: z.string().uuid(),
+  targetUserId: z.string().uuid(),
+});
+
+const httpUrl = z.string().trim().url().max(2000).refine((u) => /^https?:\/\//i.test(u), "Only http(s) links are supported");
+
+export const pollCreateSchema = z
+  .object({
+    roomId: z.string().uuid(),
+    question: z.string().trim().min(1).max(200),
+    options: z.array(z.string().trim().min(1).max(200)).min(2).max(6),
+    queueWinner: z.boolean().optional(),
+    durationSeconds: z.union([z.literal(0), z.literal(30), z.literal(60), z.literal(120), z.literal(300)]).optional(),
+  })
+  .refine((p) => !p.queueWinner || p.options.every((o) => httpUrl.safeParse(o).success), "Queue polls need a video link for every option");
+
+export const pollVoteSchema = z.object({
+  roomId: z.string().uuid(),
+  pollId: z.string().uuid(),
+  option: z.number().int().min(0).max(5),
+});
+
+export const pollCloseSchema = z.object({
+  roomId: z.string().uuid(),
+  pollId: z.string().uuid(),
+});
+
+export const slowModeSchema = z.object({
+  roomId: z.string().uuid(),
+  seconds: z.union([z.literal(0), z.literal(5), z.literal(10), z.literal(30), z.literal(60)]),
+});
+
+export const muteSchema = z.object({
+  roomId: z.string().uuid(),
+  targetUserId: z.string().uuid(),
+  /** 0 unmutes; null mutes until unmuted. */
+  minutes: z.union([z.literal(0), z.literal(5), z.literal(15), z.literal(60), z.null()]),
 });
 
 export const validateSocketPayload = <T>(schema: z.ZodType<T>, data: unknown, socket: Socket): T | null => {

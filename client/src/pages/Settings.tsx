@@ -4,12 +4,16 @@ import api, { getErrorMessage } from "../lib/api";
 import { resizeAvatar } from "../lib/image";
 import { useAuthStore } from "../store/useAuthStore";
 import { rememberAvatars } from "../store/useAvatarStore";
+import { useSocketStore } from "../store/useSocketStore";
 import { toast } from "../store/useToastStore";
 import Logo from "../components/ui/Logo";
 import Avatar from "../components/ui/Avatar";
 import Spinner from "../components/ui/Spinner";
 import PasswordInput from "../components/PasswordInput";
 import { Link } from "react-router-dom";
+import { useEffect } from "react";
+import { Bell } from "lucide-react";
+import { disablePush, enablePush, getPushStatus, type PushStatus } from "../lib/push";
 
 export default function Settings() {
   const { user, setUser, setToken } = useAuthStore();
@@ -76,7 +80,13 @@ export default function Settings() {
     if (newPassword !== confirmPassword) return toast.error("New passwords don't match");
     setSavingPassword(true);
     try {
-      const res = await api.post("/auth/me/password", { currentPassword, newPassword });
+      // Tell the server which live connection is ours so it isn't dropped with the others.
+      const socketId = useSocketStore.getState().socket?.id;
+      const res = await api.post(
+        "/auth/me/password",
+        { currentPassword, newPassword },
+        socketId ? { headers: { "X-Socket-Id": socketId } } : undefined
+      );
       setToken(res.data.token);
       setCurrentPassword("");
       setNewPassword("");
@@ -156,6 +166,8 @@ export default function Settings() {
           </div>
         </section>
 
+        <NotificationSettings />
+
         <section className="card p-6">
           <h2 className="mb-5 flex items-center gap-2 font-display font-semibold"><KeyRound size={18} className="text-indigo-300" /> Password</h2>
           <form onSubmit={changePassword} className="grid gap-4 sm:max-w-sm">
@@ -179,5 +191,54 @@ export default function Settings() {
         </section>
       </main>
     </div>
+  );
+}
+
+function NotificationSettings() {
+  const [status, setStatus] = useState<PushStatus | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    getPushStatus().then(setStatus).catch(() => setStatus("unavailable"));
+  }, []);
+
+  const toggle = async () => {
+    setBusy(true);
+    try {
+      if (status === "enabled") {
+        await disablePush();
+        toast.success("Notifications turned off for this browser");
+      } else {
+        await enablePush();
+        toast.success("You'll get notifications even when WatchTogether is closed");
+      }
+      setStatus(await getPushStatus());
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Couldn't change notification settings");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const note: Record<PushStatus, string> = {
+    unsupported: "This browser doesn't support push notifications.",
+    unavailable: "Push notifications aren't set up on this server.",
+    denied: "Notifications are blocked for this site. Allow them in your browser's site settings, then come back.",
+    enabled: "On for this browser. Invites, friend requests and party reminders arrive even when the site is closed.",
+    disabled: "Get invites, friend requests and party reminders even when the site is closed.",
+  };
+
+  return (
+    <section className="card p-6">
+      <h2 className="mb-3 flex items-center gap-2 font-display font-semibold"><Bell size={18} className="text-indigo-300" /> Notifications</h2>
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+        <p className="text-sm text-slate-400">{status ? note[status] : "Checking…"}</p>
+        {(status === "enabled" || status === "disabled") && (
+          <button onClick={toggle} disabled={busy} className={`${status === "enabled" ? "btn-secondary" : "btn-primary"} shrink-0`}>
+            {busy && <Spinner className="h-4 w-4" />} {status === "enabled" ? "Turn off" : "Turn on"}
+          </button>
+        )}
+      </div>
+    </section>
   );
 }

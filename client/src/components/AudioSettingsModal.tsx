@@ -23,6 +23,36 @@ export default function AudioSettingsModal({ isOpen, onClose }: Props) {
       }
     >
         <div className="p-6 space-y-6 max-h-[80vh] overflow-y-auto">
+          {/* Latency compensation */}
+          <div className="space-y-3 rounded-xl border border-white/10 bg-white/[0.02] p-4">
+            <div className="flex items-center justify-between">
+              <div>
+                <h3 className="font-semibold text-slate-200">Audio delay compensation</h3>
+                <p className="text-sm text-slate-400">Using Bluetooth headphones? Shift the video so what you hear matches everyone else.</p>
+              </div>
+              <span className="shrink-0 font-mono text-sm text-indigo-300">
+                {settings.syncOffsetMs > 0 ? "+" : ""}{settings.syncOffsetMs} ms
+              </span>
+            </div>
+            <input
+              type="range"
+              min={-500}
+              max={1000}
+              step={25}
+              value={settings.syncOffsetMs}
+              onChange={(e) => updateSettings({ syncOffsetMs: Number(e.target.value) })}
+              className="w-full accent-indigo-500"
+              aria-label="Audio delay compensation in milliseconds"
+            />
+            <div className="flex justify-between text-xs text-slate-500">
+              <span>Play later</span>
+              <button type="button" onClick={() => updateSettings({ syncOffsetMs: 0 })} className="text-indigo-300 hover:text-indigo-200">
+                Reset
+              </button>
+              <span>Play earlier</span>
+            </div>
+          </div>
+
           {/* Global Toggle */}
           <div className="flex items-center justify-between">
             <div>

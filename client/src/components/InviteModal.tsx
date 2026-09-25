@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react";
-import { Copy, Check, Mail, Send, UserPlus } from "lucide-react";
+import { Copy, Check, Link2, Mail, Send, Trash2, UserPlus, UsersRound } from "lucide-react";
 import api, { getErrorMessage } from "../lib/api";
 import { copyToClipboard } from "../lib/format";
 import { toast } from "../store/useToastStore";
@@ -22,9 +22,40 @@ interface InviteModalProps {
   onClose: () => void;
   roomId: string;
   roomCode?: string | null;
+  /** Host or co-host: may create invite links. */
+  canManage?: boolean;
 }
 
-export default function InviteModal({ isOpen, onClose, roomId, roomCode }: InviteModalProps) {
+interface InviteLink {
+  id: string;
+  expiresAt: string;
+  maxUses: number | null;
+  uses: number;
+  url?: string;
+}
+
+interface FriendGroup {
+  id: string;
+  name: string;
+  members: { id: string; name: string }[];
+}
+
+const EXPIRY_OPTIONS = [
+  { hours: 1, label: "1 hour" },
+  { hours: 24, label: "1 day" },
+  { hours: 168, label: "7 days" },
+  { hours: 720, label: "30 days" },
+];
+const USE_OPTIONS: (number | null)[] = [1, 5, 25, null];
+
+export default function InviteModal({ isOpen, onClose, roomId, roomCode, canManage = false }: InviteModalProps) {
+  const [links, setLinks] = useState<InviteLink[]>([]);
+  const [newLinkUrls, setNewLinkUrls] = useState<Record<string, string>>({});
+  const [expiryHours, setExpiryHours] = useState(24);
+  const [maxUses, setMaxUses] = useState<number | null>(5);
+  const [creatingLink, setCreatingLink] = useState(false);
+  const [groups, setGroups] = useState<FriendGroup[]>([]);
+  const [groupState, setGroupState] = useState<Record<string, "sending" | "sent">>({});
   const [friends, setFriends] = useState<Friend[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [copied, setCopied] = useState<"link" | "code" | null>(null);
@@ -40,6 +71,20 @@ export default function InviteModal({ isOpen, onClose, roomId, roomCode }: Invit
     setIsLoading(true);
     setInviteState({});
     api
+      .get("/friends/groups")
+      .then((res) => {
+        if (!cancelled) setGroups(res.data.groups.filter((g: FriendGroup) => g.members.length > 0));
+      })
+      .catch(() => undefined);
+    if (canManage) {
+      api
+        .get(`/rooms/${roomId}/invite-links`)
+        .then((res) => {
+          if (!cancelled) setLinks(res.data.links);
+        })
+        .catch(() => undefined);
+    }
+    api
       .get("/friends")
       .then((res) => {
         if (!cancelled) setFriends(res.data.friends.filter((f: Friend) => f.status === "ACCEPTED"));
@@ -51,7 +96,48 @@ export default function InviteModal({ isOpen, onClose, roomId, roomCode }: Invit
     return () => {
       cancelled = true;
     };
-  }, [isOpen]);
+  }, [isOpen, canManage, roomId]);
+
+  const createLink = async () => {
+    setCreatingLink(true);
+    try {
+      const res = await api.post(`/rooms/${roomId}/invite-links`, { expiresInHours: expiryHours, maxUses });
+      const link: InviteLink = res.data.link;
+      setLinks((list) => [link, ...list]);
+      // The full URL is only returned once; keep it so it can still be copied this session.
+      setNewLinkUrls((urls) => ({ ...urls, [link.id]: link.url! }));
+      if (link.url && (await copyToClipboard(link.url))) toast.success("Invite link copied");
+    } catch (error) {
+      toast.error(getErrorMessage(error, "Couldn't create an invite link"));
+    } finally {
+      setCreatingLink(false);
+    }
+  };
+
+  const revokeLink = async (linkId: string) => {
+    try {
+      await api.delete(`/rooms/${roomId}/invite-links/${linkId}`);
+      setLinks((list) => list.filter((l) => l.id !== linkId));
+    } catch (error) {
+      toast.error(getErrorMessage(error, "Couldn't revoke the link"));
+    }
+  };
+
+  const inviteGroup = async (group: FriendGroup) => {
+    setGroupState((s) => ({ ...s, [group.id]: "sending" }));
+    try {
+      const res = await api.post(`/rooms/${roomId}/invite-group`, { groupId: group.id });
+      setGroupState((s) => ({ ...s, [group.id]: "sent" }));
+      toast.success(res.data.message);
+    } catch (error) {
+      setGroupState((s) => {
+        const next = { ...s };
+        delete next[group.id];
+        return next;
+      });
+      toast.error(getErrorMessage(error, "Couldn't invite the group"));
+    }
+  };
 
   const handleCopy = async (kind: "link" | "code", text: string) => {
     if (await copyToClipboard(text)) {
@@ -129,6 +215,76 @@ export default function InviteModal({ isOpen, onClose, roomId, roomCode }: Invit
           <button onClick={shareNative} className="btn-secondary w-full sm:hidden">
             <Send size={16} /> Share via…
           </button>
+        )}
+
+        {canManage && (
+          <div className="rounded-xl border border-white/10 bg-white/[0.02] p-3">
+            <span className="label">Invite link (no password needed)</span>
+            <div className="flex flex-wrap items-center gap-2">
+              <select value={expiryHours} onChange={(e) => setExpiryHours(Number(e.target.value))} className="input w-auto py-1.5 text-xs" aria-label="Link expiry">
+                {EXPIRY_OPTIONS.map((o) => (
+                  <option key={o.hours} value={o.hours} className="bg-ink-900">Expires in {o.label}</option>
+                ))}
+              </select>
+              <select
+                value={maxUses === null ? "unlimited" : String(maxUses)}
+                onChange={(e) => setMaxUses(e.target.value === "unlimited" ? null : Number(e.target.value))}
+                className="input w-auto py-1.5 text-xs"
+                aria-label="Maximum uses"
+              >
+                {USE_OPTIONS.map((u) => (
+                  <option key={String(u)} value={u === null ? "unlimited" : String(u)} className="bg-ink-900">
+                    {u === null ? "Unlimited uses" : `${u} use${u === 1 ? "" : "s"}`}
+                  </option>
+                ))}
+              </select>
+              <button onClick={createLink} disabled={creatingLink} className="btn-primary px-3 py-1.5 text-xs">
+                {creatingLink ? <Spinner className="h-3.5 w-3.5" /> : <Link2 size={14} />} Create link
+              </button>
+            </div>
+            {links.length > 0 && (
+              <div className="mt-3 space-y-1.5">
+                {links.map((link) => (
+                  <div key={link.id} className="flex items-center justify-between gap-2 rounded-lg bg-ink-950/60 px-2.5 py-1.5 text-xs">
+                    <span className="min-w-0 truncate text-slate-400">
+                      {link.maxUses === null ? `${link.uses} used` : `${link.uses}/${link.maxUses} used`} · expires{" "}
+                      {new Date(link.expiresAt).toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })}
+                    </span>
+                    <span className="flex shrink-0 items-center gap-1">
+                      {newLinkUrls[link.id] && (
+                        <button onClick={() => handleCopy("link", newLinkUrls[link.id])} className="btn-ghost p-1" title="Copy link" aria-label="Copy invite link">
+                          <Copy size={13} />
+                        </button>
+                      )}
+                      <button onClick={() => revokeLink(link.id)} className="btn-ghost p-1 hover:text-red-300" title="Revoke link" aria-label="Revoke invite link">
+                        <Trash2 size={13} />
+                      </button>
+                    </span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {groups.length > 0 && (
+          <div>
+            <span className="label">Groups</span>
+            <div className="flex flex-wrap gap-2">
+              {groups.map((group) => (
+                <button
+                  key={group.id}
+                  onClick={() => inviteGroup(group)}
+                  disabled={!!groupState[group.id]}
+                  className={`${groupState[group.id] === "sent" ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-300" : ""} btn-secondary px-3 py-1.5 text-xs`}
+                  title={group.members.map((m) => m.name).join(", ")}
+                >
+                  {groupState[group.id] === "sent" ? <Check size={13} /> : groupState[group.id] === "sending" ? <Spinner className="h-3.5 w-3.5" /> : <UsersRound size={13} />}
+                  {group.name} · {group.members.length}
+                </button>
+              ))}
+            </div>
+          </div>
         )}
 
         <div>

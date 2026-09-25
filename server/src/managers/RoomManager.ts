@@ -60,6 +60,46 @@ interface RoomState {
   skipVotes: Set<string>; // userIds voting to skip the current video
   participantSync: Map<string, { state: SyncState; drift: number }>; // socketId -> report
   participantAvatars: Map<string, number | null>; // socketId -> avatar version
+  recentlyPlayed: { url: string; playedAt: number }[];
+  countdown: { endsAt: number; timer: NodeJS.Timeout } | null;
+  poll: Poll | null;
+  slowModeSeconds: number;
+  mutedUntil: Map<string, number | null>; // userId -> expiry (null = until unmuted)
+  lastMessageAt: Map<string, number>; // userId -> time of their last chat message
+}
+
+const MAX_RECENTLY_PLAYED = 20;
+
+export interface Poll {
+  id: string;
+  question: string;
+  options: string[];
+  votes: Map<string, number>; // userId -> option index
+  createdBy: string;
+  createdByName: string;
+  /** Options are links; the winner is added to the queue when the poll closes. */
+  queueWinner: boolean;
+  closesAt: number | null;
+  closed: boolean;
+  timer: NodeJS.Timeout | null;
+}
+
+export interface PollView {
+  id: string;
+  question: string;
+  options: string[];
+  counts: number[];
+  totalVotes: number;
+  createdByName: string;
+  queueWinner: boolean;
+  closesAt: number | null;
+  closed: boolean;
+  winner: number | null;
+}
+
+export interface ChatSettings {
+  slowModeSeconds: number;
+  muted: { userId: string; until: number | null }[];
 }
 
 export class RoomManager {
@@ -67,6 +107,8 @@ export class RoomManager {
   private pendingRooms: Map<string, Promise<RoomState | null>> = new Map();
   private io: Server;
   public gracePeriodMs: number;
+  /** Called whenever a room's live session is torn down. */
+  public onRoomClosed: (roomId: string) => void = () => {};
 
   constructor(io: Server, gracePeriodMs: number = 10000) {
     this.io = io;
@@ -121,6 +163,12 @@ export class RoomManager {
           skipVotes: new Set(),
           participantSync: new Map(),
           participantAvatars: new Map(),
+          recentlyPlayed: [],
+          countdown: null,
+          poll: null,
+          slowModeSeconds: 0,
+          mutedUntil: new Map(),
+          lastMessageAt: new Map(),
           playback: {
             playing: false,
             time: dbRoom.playbackTime ?? 0,
@@ -141,6 +189,10 @@ export class RoomManager {
 
     this.pendingRooms.set(roomId, loadPromise);
     return loadPromise;
+  }
+
+  public getRoomIds(): string[] {
+    return Array.from(this.rooms.keys());
   }
 
   public getRoom(roomId: string): RoomState | undefined {
@@ -336,6 +388,11 @@ export class RoomManager {
     const hasDisconnected = room.disconnectedParticipants.size > 0;
 
     if (!hasActive && !hasDisconnected) {
+      if (room.countdown) {
+        clearTimeout(room.countdown.timer);
+        room.countdown = null;
+      }
+      if (room.poll?.timer) clearTimeout(room.poll.timer);
       let attempts = 0;
       while (attempts < 3) {
         try {
@@ -353,6 +410,7 @@ export class RoomManager {
             }),
           ]);
           this.rooms.delete(roomId);
+      this.onRoomClosed(roomId);
           return true;
         } catch (err) {
           attempts++;
@@ -363,6 +421,7 @@ export class RoomManager {
         }
       }
       this.rooms.delete(roomId);
+      this.onRoomClosed(roomId);
       return true;
     }
     return false;
@@ -376,7 +435,10 @@ export class RoomManager {
         clearTimeout(data.timeout);
       }
       room.disconnectedParticipants.clear();
+      if (room.countdown) clearTimeout(room.countdown.timer);
+      if (room.poll?.timer) clearTimeout(room.poll.timer);
       this.rooms.delete(roomId);
+      this.onRoomClosed(roomId);
     }
     this.io.to(roomId).emit("room_ended", { roomId });
     this.io.in(roomId).socketsLeave(roomId);
@@ -581,8 +643,160 @@ export class RoomManager {
       room.subtitles = null;
       room.skipVotes.clear();
       room.participantSync.clear();
+      if (room.playback.url) {
+        room.recentlyPlayed = [
+          { url: room.playback.url, playedAt: Date.now() },
+          ...room.recentlyPlayed.filter((r) => r.url !== room.playback.url),
+        ].slice(0, MAX_RECENTLY_PLAYED);
+      }
     }
     return urlChanged;
+  }
+
+  // --- Polls ---
+
+  public viewPoll(roomId: string): PollView | null {
+    const poll = this.rooms.get(roomId)?.poll;
+    if (!poll) return null;
+    const counts = poll.options.map(() => 0);
+    for (const idx of poll.votes.values()) counts[idx]++;
+    const max = Math.max(...counts);
+    return {
+      id: poll.id,
+      question: poll.question,
+      options: poll.options,
+      counts,
+      totalVotes: poll.votes.size,
+      createdByName: poll.createdByName,
+      queueWinner: poll.queueWinner,
+      closesAt: poll.closesAt,
+      closed: poll.closed,
+      // Ties go to the earliest option; no votes means no winner.
+      winner: poll.closed && max > 0 ? counts.indexOf(max) : null,
+    };
+  }
+
+  public getPoll(roomId: string) {
+    return this.rooms.get(roomId)?.poll ?? null;
+  }
+
+  public createPoll(roomId: string, poll: Omit<Poll, "votes" | "closed" | "timer">, onAutoClose: () => void): boolean {
+    const room = this.rooms.get(roomId);
+    if (!room || (room.poll && !room.poll.closed)) return false;
+    if (room.poll?.timer) clearTimeout(room.poll.timer);
+    const timer = poll.closesAt ? setTimeout(onAutoClose, poll.closesAt - Date.now()) : null;
+    room.poll = { ...poll, votes: new Map(), closed: false, timer };
+    return true;
+  }
+
+  public votePoll(roomId: string, pollId: string, userId: string, option: number): boolean {
+    const poll = this.rooms.get(roomId)?.poll;
+    if (!poll || poll.id !== pollId || poll.closed || option < 0 || option >= poll.options.length) return false;
+    poll.votes.set(userId, option);
+    return true;
+  }
+
+  /** Closes the poll and returns the winning option index (or null). */
+  public closePoll(roomId: string, pollId: string): { winner: number | null } | null {
+    const poll = this.rooms.get(roomId)?.poll;
+    if (!poll || poll.id !== pollId || poll.closed) return null;
+    poll.closed = true;
+    if (poll.timer) clearTimeout(poll.timer);
+    poll.timer = null;
+    return { winner: this.viewPoll(roomId)!.winner };
+  }
+
+  public getUserVote(roomId: string, userId: string): number | null {
+    return this.rooms.get(roomId)?.poll?.votes.get(userId) ?? null;
+  }
+
+  // --- Chat moderation ---
+
+  public getChatSettings(roomId: string): ChatSettings {
+    const room = this.rooms.get(roomId);
+    if (!room) return { slowModeSeconds: 0, muted: [] };
+    const now = Date.now();
+    for (const [uid, until] of room.mutedUntil) if (until !== null && until <= now) room.mutedUntil.delete(uid);
+    return {
+      slowModeSeconds: room.slowModeSeconds,
+      muted: Array.from(room.mutedUntil.entries()).map(([userId, until]) => ({ userId, until })),
+    };
+  }
+
+  public setSlowMode(roomId: string, seconds: number) {
+    const room = this.rooms.get(roomId);
+    if (room) room.slowModeSeconds = seconds;
+  }
+
+  public setMuted(roomId: string, userId: string, until: number | null | undefined) {
+    const room = this.rooms.get(roomId);
+    if (!room) return;
+    if (until === undefined) room.mutedUntil.delete(userId);
+    else room.mutedUntil.set(userId, until);
+  }
+
+  /** Why this user can't post right now, or null if they can. Records the post if allowed. */
+  public checkCanChat(roomId: string, userId: string): string | null {
+    const room = this.rooms.get(roomId);
+    if (!room) return null;
+    if (room.mutedUntil.has(userId)) {
+      const until = room.mutedUntil.get(userId)!;
+      if (until === null || until > Date.now()) {
+        return until === null ? "You've been muted by the host" : `You're muted for ${Math.ceil((until - Date.now()) / 60000)} more minute(s)`;
+      }
+      room.mutedUntil.delete(userId);
+    }
+    // Hosts and co-hosts aren't slowed down.
+    if (room.slowModeSeconds > 0 && !this.isAuthorized(roomId, userId)) {
+      const last = room.lastMessageAt.get(userId) ?? 0;
+      const wait = Math.ceil((last + room.slowModeSeconds * 1000 - Date.now()) / 1000);
+      if (wait > 0) return `Slow mode is on — wait ${wait}s before sending another message`;
+    }
+    room.lastMessageAt.set(userId, Date.now());
+    return null;
+  }
+
+  public getRecentlyPlayed(roomId: string) {
+    return this.rooms.get(roomId)?.recentlyPlayed ?? [];
+  }
+
+  public async removeCoHost(roomId: string, targetUserId: string): Promise<boolean> {
+    const room = this.rooms.get(roomId);
+    if (!room || !room.coHosts.has(targetUserId)) return false;
+    room.coHosts.delete(targetUserId);
+    try {
+      await prisma.roomCoHost.deleteMany({ where: { roomId, userId: targetUserId } });
+    } catch (err) {
+      console.error("Failed to remove co-host from DB", err);
+    }
+    return true;
+  }
+
+  /** Starts a countdown that calls onDone when it ends. Returns false if one is already running. */
+  public startCountdown(roomId: string, seconds: number, onDone: () => void): number | null {
+    const room = this.rooms.get(roomId);
+    if (!room || room.countdown) return null;
+    const endsAt = Date.now() + seconds * 1000;
+    const timer = setTimeout(() => {
+      if (this.rooms.get(roomId)?.countdown?.timer === timer) {
+        room.countdown = null;
+        onDone();
+      }
+    }, seconds * 1000);
+    room.countdown = { endsAt, timer };
+    return endsAt;
+  }
+
+  public cancelCountdown(roomId: string): boolean {
+    const room = this.rooms.get(roomId);
+    if (!room?.countdown) return false;
+    clearTimeout(room.countdown.timer);
+    room.countdown = null;
+    return true;
+  }
+
+  public getCountdownEndsAt(roomId: string): number | null {
+    return this.rooms.get(roomId)?.countdown?.endsAt ?? null;
   }
 
   public getUserRoomId(userId: string): string | undefined {

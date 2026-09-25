@@ -5,6 +5,10 @@ import { PrismaClient } from "@prisma/client";
 process.env.JWT_SECRET = process.env.JWT_SECRET || "test_jwt_secret_key_12345";
 process.env.TURN_URLS = "turn:turn.example.com:3478";
 process.env.TURN_SECRET = "turn-test-secret";
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const vapid = (require("web-push") as typeof import("web-push")).generateVAPIDKeys();
+process.env.VAPID_PUBLIC_KEY = vapid.publicKey;
+process.env.VAPID_PRIVATE_KEY = vapid.privateKey;
 
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const { createApp } = require("../app") as typeof import("../app");
@@ -180,6 +184,157 @@ async function run() {
     bobInRoom.emit("join_room", { roomId, userId: bob.user.id, userName: "Bob" });
     await wait(500);
     assert(!rejoinErrors.some((e) => /removed/.test(e.message)), "Unbanned user can rejoin", rejoinErrors);
+
+    console.log("\n--- Invites require room membership ---");
+    const carol = await register("Carol");
+    r = await call("POST", `/rooms/${roomId}/invite`, { email: bob.user.email }, carol.token);
+    assert(r.status === 403, "Strangers can't send invites for a room", r.status);
+    r = await call("POST", `/rooms/${roomId}/invite`, { email: bob.user.email }, alice.token);
+    assert(r.status === 200, "The host can invite", r.json);
+
+    console.log("\n--- Live list only shows rooms with people ---");
+    r = await call("POST", "/rooms", { name: "Empty Public", isPrivate: false }, alice.token);
+    const emptyId = r.json.room.id;
+    r = await call("GET", "/rooms", undefined, carol.token);
+    assert(!r.json.rooms.some((room: { id: string }) => room.id === emptyId), "Empty rooms aren't listed as live");
+    assert(r.json.rooms.some((room: { id: string }) => room.id === roomId), "Occupied public rooms are listed");
+
+    console.log("\n--- Start-time reminders ---");
+    const { runReminderSweep } = await import("../managers/ReminderScheduler");
+    const dueRoom = await prisma.room.create({
+      data: { name: "Due Now", hostId: alice.user.id, scheduledFor: new Date(Date.now() - 60_000) },
+    });
+    const staleRoom = await prisma.room.create({
+      data: { name: "Long Gone", hostId: alice.user.id, scheduledFor: new Date(Date.now() - 3 * 3600_000) },
+    });
+    const before = notes.length;
+    const notified = await runReminderSweep(io);
+    await wait(300);
+    assert(notified.includes(dueRoom.id), "Due rooms get a reminder");
+    assert(!notified.includes(staleRoom.id), "Parties that started long ago are skipped");
+    assert(notes.slice(before).some((n) => n.roomId === dueRoom.id && /starting now/.test(n.body)), "Friends are told it's starting");
+    const again = await runReminderSweep(io);
+    assert(!again.includes(dueRoom.id), "Reminders are only sent once");
+    r = await call("PATCH", `/rooms/${dueRoom.id}`, { scheduledFor: new Date(Date.now() + 3600_000).toISOString() }, alice.token);
+    const rescheduled = await prisma.room.findUnique({ where: { id: dueRoom.id } });
+    assert(r.status === 200 && rescheduled?.reminderSentAt === null, "Rescheduling re-arms the reminder");
+
+    console.log("\n--- Password change drops other sessions ---");
+    const carolPhone = await connect(carol.token);
+    const carolLaptop = await connect(carol.token);
+    const phoneDropped = new Promise((res) => carolPhone.once("disconnect", (reason) => res(reason)));
+    await wait(1100);
+    const res = await fetch(`${base}/api/auth/me/password`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${carol.token}`, "x-socket-id": carolLaptop.id! },
+      body: JSON.stringify({ currentPassword: "Secret123!", newPassword: "Changed123" }),
+    });
+    assert(res.status === 200, "Password changed");
+    assert((await Promise.race([phoneDropped, wait(2000).then(() => "timeout")])) === "io server disconnect", "Other devices are disconnected");
+    await wait(300);
+    assert(carolLaptop.connected, "The requesting device stays connected");
+    const reconnect = await new Promise<string>((resolve) => {
+      const s = Client(base, { auth: { token: carol.token }, reconnection: false, forceNew: true });
+      sockets.push(s);
+      s.on("connect", () => resolve("connected"));
+      s.on("connect_error", (e) => resolve(e.message));
+    });
+    assert(reconnect.startsWith("Authentication error"), "Old tokens can't open new connections", reconnect);
+
+    console.log("\n--- Room join attempts are throttled ---");
+    const privateRoom = await call("POST", "/rooms", { name: "Locked", isPrivate: true, password: "right" }, alice.token);
+    let status = 0;
+    for (let i = 0; i < 11; i++) {
+      status = (await call("POST", "/rooms/join", { roomId: privateRoom.json.room.id, password: `wrong${i}` }, bob.token)).status;
+    }
+    assert(status === 429, "11th join attempt for the same room is throttled", status);
+
+    console.log("\n--- Expiring invite links ---");
+    const dave = await register("Dave");
+    const erin = await register("Erin");
+    const locked = privateRoom.json.room.id as string;
+    r = await call("POST", `/rooms/${locked}/invite-links`, { expiresInHours: 24, maxUses: 1 }, dave.token);
+    assert(r.status === 403, "Only hosts/co-hosts create invite links");
+    r = await call("POST", `/rooms/${locked}/invite-links`, { expiresInHours: 24, maxUses: 1 }, alice.token);
+    assert(r.status === 201 && /\/invite\/[\w-]{20,}$/.test(r.json.link.url), "Host creates a link", r.json);
+    const token = (r.json.link.url as string).split("/invite/")[1];
+    const stored = await prisma.roomInviteLink.findFirst({ where: { roomId: locked } });
+    assert(!!stored && !stored.tokenHash.includes(token), "Only a hash of the link token is stored");
+    r = await call("GET", `/invites/${token}`, undefined, dave.token);
+    assert(r.status === 200 && r.json.valid === true && r.json.room.name === "Locked", "Anyone signed in can preview the link");
+    r = await call("POST", "/rooms/join", { roomId: locked }, dave.token);
+    assert(r.status === 403, "Without the link, the password is still required");
+    r = await call("POST", `/invites/${token}/accept`, undefined, dave.token);
+    assert(r.status === 200 && r.json.roomId === locked, "Accepting the link grants access");
+    r = await call("POST", "/rooms/join", { roomId: locked }, dave.token);
+    assert(r.status === 200, "Link holders skip the password");
+    r = await call("GET", `/rooms/${locked}`, undefined, dave.token);
+    assert(r.json.room.canSkipPassword === true, "Room details tell the client to skip the prompt");
+    const daveSocket = await connect(dave.token);
+    const daveErrors: any[] = [];
+    daveSocket.on("error", (e) => daveErrors.push(e));
+    const daveJoined = new Promise((res) => daveSocket.once("room_state", res));
+    daveSocket.emit("join_room", { roomId: locked, userId: dave.user.id, userName: "Dave" });
+    assert((await Promise.race([daveJoined.then(() => "joined"), wait(2000).then(() => "timeout")])) === "joined", "Link holders join the private room over the socket", daveErrors);
+    r = await call("POST", `/invites/${token}/accept`, undefined, erin.token);
+    assert(r.status === 410, "Single-use links are used up after one person", r.json);
+    r = await call("POST", `/rooms/${locked}/invite-links`, { expiresInHours: 1 }, alice.token);
+    const second = r.json.link;
+    r = await call("GET", `/rooms/${locked}/invite-links`, undefined, alice.token);
+    assert(r.json.links.length === 1 && r.json.links[0].id === second.id, "Active links are listed (used-up ones drop off)");
+    await call("DELETE", `/rooms/${locked}/invite-links/${second.id}`, undefined, alice.token);
+    r = await call("POST", `/invites/${(second.url as string).split("/invite/")[1]}/accept`, undefined, erin.token);
+    assert(r.status === 410 && /revoked/.test(r.json.error), "Revoked links stop working");
+    await prisma.roomInviteLink.updateMany({ where: { roomId: locked }, data: { revokedAt: null, expiresAt: new Date(Date.now() - 1000), uses: 0 } });
+    r = await call("POST", `/invites/${token}/accept`, undefined, erin.token);
+    assert(r.status === 410 && /expired/.test(r.json.error), "Expired links stop working");
+
+    console.log("\n--- Friend groups ---");
+    // alice & bob are friends; carol is not alice's friend
+    r = await call("POST", "/friends/groups", { name: "Movie crew", memberIds: [bob.user.id, erin.user.id] }, alice.token);
+    assert(r.status === 201 && r.json.group.members.length === 1 && r.json.group.members[0].id === bob.user.id, "Groups only keep accepted friends");
+    const groupId = r.json.group.id as string;
+    r = await call("PATCH", `/friends/groups/${groupId}`, { name: "Crew" }, alice.token);
+    assert(r.status === 200 && r.json.group.name === "Crew", "Groups can be renamed");
+    r = await call("PATCH", `/friends/groups/${groupId}`, { name: "Hijack" }, bob.token);
+    assert(r.status === 404, "Others can't edit your groups");
+    const bobInvites: any[] = [];
+    const bobSocket2 = await connect(bob.token);
+    bobSocket2.on("notification", (n) => bobInvites.push(n));
+    await wait(200);
+    r = await call("POST", `/rooms/${roomId}/invite-group`, { groupId }, alice.token);
+    await wait(300);
+    assert(r.status === 200 && r.json.invited === 1 && bobInvites.some((n) => n.roomId === roomId), "Inviting a group notifies its members", r.json);
+    r = await call("GET", "/friends/groups", undefined, alice.token);
+    assert(r.json.groups.length === 1, "Groups are listed");
+    await call("DELETE", `/friends/groups/${groupId}`, undefined, alice.token);
+    r = await call("GET", "/friends/groups", undefined, alice.token);
+    assert(r.json.groups.length === 0, "Groups can be deleted");
+
+    console.log("\n--- Chat replays ---");
+    await prisma.message.createMany({
+      data: [
+        { roomId, userId: alice.user.id, content: "late", videoUrl: "https://example.com/film.mp4", videoTime: 90 },
+        { roomId, userId: bob.user.id, content: "early", videoUrl: "https://example.com/film.mp4", videoTime: 5 },
+      ],
+    });
+    r = await call("GET", `/rooms/${roomId}/replays`, undefined, alice.token);
+    assert(r.json.replays?.some((x: any) => x.videoUrl === "https://example.com/film.mp4" && x.messageCount === 2), "Replays are listed per video", r.json);
+    r = await call("GET", `/rooms/${roomId}/replay?url=${encodeURIComponent("https://example.com/film.mp4")}`, undefined, alice.token);
+    assert(r.json.messages?.map((m: any) => m.content).join() === "early,late", "Replay messages are ordered by video time");
+    r = await call("GET", `/rooms/${roomId}/replays`, undefined, erin.token);
+    assert(r.status === 403, "Non-members can't read a room's replays");
+
+    console.log("\n--- Push subscriptions ---");
+    r = await call("GET", "/push/config");
+    assert(r.json.enabled === true && r.json.publicKey === vapid.publicKey, "Push config exposes the public key");
+    const sub = { endpoint: `https://push.example.test/${stamp}`, keys: { p256dh: "BNcRdreALRFXTkOOUHK1EtK2wtaz5Ry4YfYCA_0QTpQtUbVlUls0VJXg7A8u-Ts1XbjhazAkj7I99e8QcYP7DkM", auth: "tBHItJI5svbpez7KI4CCXg" } };
+    r = await call("POST", "/push/subscribe", { endpoint: "http://insecure.test/x", keys: sub.keys }, alice.token);
+    assert(r.status === 400, "Only https push endpoints are accepted");
+    r = await call("POST", "/push/subscribe", sub, alice.token);
+    assert(r.status === 201 && !!(await prisma.pushSubscription.findUnique({ where: { endpoint: sub.endpoint } })), "Subscriptions are stored");
+    r = await call("DELETE", "/push/subscribe", { endpoint: sub.endpoint }, alice.token);
+    assert(!(await prisma.pushSubscription.findUnique({ where: { endpoint: sub.endpoint } })), "Unsubscribing removes it");
   } finally {
     sockets.forEach((s) => s.disconnect());
     io.close();
